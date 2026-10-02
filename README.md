@@ -16,7 +16,7 @@ pi -e ./src/index.ts
 # Or copy this directory to ~/.pi/agent/extensions/pi-memory/
 ```
 
-Runtime peers are declared in `package.json`. Local verification uses pi 0.85.1. A second loaded copy stays inert and reports the duplicate.
+Runtime peers are declared in `package.json`. Local verification uses pi 0.99.1. A second loaded copy stays inert and reports the duplicate.
 
 ## Storage and upgrading
 

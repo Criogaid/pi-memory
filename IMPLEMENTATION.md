@@ -24,7 +24,7 @@ Enterprise services, paid semantic retrieval, replacing pi's instruction loader,
 | Baseline and design | Complete | Initial commit `159236d`; pi 0.85.1 docs and session-state example inspected; original E2E and strict check passed |
 | Correctness and persistence | Complete | Nine regression cases failed before changes; all 14 current regressions plus original E2E, strict/no-unused TypeScript checks and diff checks pass |
 | Recall state and freshness | Complete | 22 behavior regressions and cleaned lifecycle acceptance pass; real session branches/compaction drive recall restoration; freshness preserves the system prefix |
-| npm toolchain | Complete | Locked pi 0.85.1 development dependencies; Node runner with pi's Jiti dependency; npm check and both test suites pass |
+| npm toolchain | Complete | Locked pi 0.99.1 development dependencies (upgraded from 0.85.1); Node runner with pi's Jiti dependency; npm check and both test suites pass |
 | Extraction workflow | Complete | 30 behavior regressions plus lifecycle acceptance; complete-body reads, parent context, stale-write rejection, cancellation, reload cursors, and sequential operations verified through public commands/events |
 | Dream lifecycle and settings | Complete | 44 behavior regressions plus lifecycle acceptance pass; persisted switches, bounded session/evidence input, completion state, scheduling, cancellation, and cross-process ownership verified |
 | Final audit and documentation | Complete | Acceptance audit below; strict/no-unused TypeScript checks, diff checks, dependency inspection, and local package preview passed; README and PORT-MATRIX match the implementation |
@@ -134,3 +134,9 @@ The existing `.pi/memory.json` format remains the settings owner. Pi 0.99.1 expo
 Final verification: all 70 regressions and lifecycle acceptance pass with `npm test`; `npm run check`, the no-unused TypeScript check, and `git diff --check` pass. Seven new behavior cases cover native panel rendering and repeated in-place toggles, rollback/retry, live feature switches, finishing a queued save before Escape closes the panel, command completion/idempotent pause, RPC/invalid-command handling, and preserving in-flight extraction when the same switch values are applied again. The lifecycle acceptance fixture passes string command arguments, matching Pi's public contract.
 
 Installed-host verification: Pi 0.99.1 loaded the extension through its real RPC CLI in an isolated temporary project. `/memory` returned the current six-switch state without opening a terminal component; command discovery succeeded and stderr was empty. Terminal interaction tests exercise Pi 0.85.1's real SettingsList and renderer through a mocked UI boundary. No live-model request or personal-memory write was used.
+
+## Pi 0.99 dependency upgrade
+
+Development dependencies are pinned to pi 0.99.1 (typebox 1.3.27, matching pi), and the runtime peer range is `>=0.99.1 <0.100`. The upgrade exists so memory jobs can pass a provider-neutral thinking level: pi 0.85's public `ModelRegistry` exposes only provider-specific `complete` options, while 0.99 adds `completeSimple`/`streamSimple` with `reasoning`. Pi 0.99's tool path normalization (`utils/paths.js` `normalizePath`/`resolvePath`) was compared with `resolveToolPath` and matches; the helper is still not exported.
+
+Verification: `npm run check` reports no business-code errors; one test-file type error remains (`test/regressions.test.ts` passes an `ExtensionContext` where 0.99 tool execution expects `ExtensionToolContext`) and is handed off with the test work. All 70 regressions and lifecycle acceptance pass at runtime on 0.99.1; `git diff --check` passes.

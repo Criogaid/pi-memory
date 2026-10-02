@@ -204,7 +204,7 @@ export type MemoryChange =
 	| { readonly kind: "promote"; readonly ref: string };
 export type MutationResult = { readonly ok: true } | { readonly ok: false; readonly error: string };
 
-/** Match pi 0.85's tool path expansion at this boundary; its helper is not public. */
+/** Match pi 0.99's tool path expansion at this boundary; its helper is not public. */
 export function resolveToolPath(target: string, cwd: string): string {
 	let normalized = target.replace(/[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g, " ").replace(/^@/, "");
 	if (process.platform === "win32" && !normalized.startsWith("//") && !normalized.includes("\\")) {
