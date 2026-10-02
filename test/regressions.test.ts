@@ -9,7 +9,7 @@ import { createEditTool, createWriteTool, initTheme, SessionManager, withFileMut
 import { getKeybindings, type Component, type TUI } from "@earendil-works/pi-tui";
 import { setTimeout as delay } from "node:timers/promises";
 import type { BeforeAgentStartEventResult } from "@earendil-works/pi-coding-agent";
-import type { Api, AssistantMessage, Context, Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
+import { getSupportedThinkingLevels, type Api, type AssistantMessage, type Context, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { JobModelKey, JobModelSelection } from "../src/config.ts";
 import type { MemoryJobRequest } from "../src/workflow.ts";
 import { isolateMemoryHome } from "./fixtures/memory-home.ts";
@@ -69,7 +69,6 @@ async function createSession() {
 	let panel: (Component & { dispose?(): void }) | undefined;
 	let panelDriver: ((component: Component, dialog: number) => void | Promise<void>) | undefined;
 	let dialogCount = 0;
-	let selectReply: (items: readonly string[]) => string | undefined | Promise<string | undefined> = () => undefined;
 	const custom = async (build: (tui: Pick<TUI, "requestRender">, theme: unknown, keybindings: unknown, done: (value: unknown) => void) => Component | Promise<Component>) => {
 		initTheme("dark");
 		const closed = Promise.withResolvers<unknown>();
@@ -91,7 +90,7 @@ async function createSession() {
 			},
 		},
 		getSystemPrompt: () => parentRule,
-		ui: { notify: (text: string) => notifications.push(text), setStatus: () => {}, select: async (_title: string, items: string[]) => selectReply(items), custom },
+		ui: { notify: (text: string) => notifications.push(text), setStatus: () => {}, custom },
 		waitForIdle: () => waitForIdle(),
 	} as unknown as ExtensionContext;
 	const api = {
@@ -134,7 +133,6 @@ async function createSession() {
 		sessionThinking: () => sessionThinking,
 		setSessionThinking: (level: ModelThinkingLevel) => { sessionThinking = level; },
 		setPanelDriver: (driver: typeof panelDriver) => { panelDriver = driver; },
-		setSelectReply: (reply: typeof selectReply) => { selectReply = reply; },
 		panel: () => panel,
 		complete: (prefix: string) => commands.get("memory")?.getArgumentCompletions?.(prefix),
 		modelCalls: () => modelCalls,
@@ -1294,15 +1292,23 @@ function pickModel(panel: Component, model: Model<Api>) {
 	panel.handleInput?.("\r");
 }
 
+/** Drives the thinking-level dialog by position, so tests do not depend on its labels. */
+function pickThinking(panel: Component, model: Model<Api>, level: ModelThinkingLevel | "session") {
+	const position = level === "session" ? 0 : getSupportedThinkingLevels(model).indexOf(level) + 1;
+	assert.ok(position >= 0);
+	for (let row = 0; row < position; row++) panel.handleInput?.("\u001b[B");
+	panel.handleInput?.("\r");
+}
+
 for (const { key } of JOB_MODEL_SETTINGS) {
 	test(`${key} picker persists the choice, reopens with that value, and updates the next job`, async () => withSession(async (s) => {
 		const model = modelFixture(), thinkingLevel = key === "extractModel" ? "high" : "off";
 		s.registerModel(model);
-		s.setSelectReply(() => thinkingLevel);
 		let reopened = false;
 		s.setPanelDriver((panel, dialog) => {
 			if (dialog === 1) openModelRow(panel, key);
 			else if (dialog === 2) pickModel(panel, model);
+			else if (dialog === 3) pickThinking(panel, model, thinkingLevel);
 			else {
 				reopened = true;
 				assert.ok(panel.render(240).join("\n").includes(model.id));
@@ -1326,13 +1332,13 @@ for (const cancelAt of ["model", "thinking"] as const) {
 		await s.emit("session_start");
 		const file = path.join(s.cwd, ".pi", "memory.json"), before = fs.readFileSync(file, "utf8");
 		let reopened = false;
-		s.setSelectReply(() => undefined);
 		s.setPanelDriver((panel, dialog) => {
 			if (dialog === 1) openModelRow(panel, "extractModel");
 			else if (dialog === 2) {
 				if (cancelAt === "model") panel.handleInput?.("\u001b");
 				else pickModel(panel, candidate);
-			} else {
+			} else if (dialog === 3 && cancelAt === "thinking") panel.handleInput?.("\u001b");
+			else {
 				reopened = true;
 				assert.ok(panel.render(240).join("\n").includes(original.id));
 				panel.handleInput?.("\u001b");
@@ -1352,7 +1358,6 @@ test("choosing the session model persists null over global config and updates th
 	fs.writeFileSync(s.globalConfigFile, JSON.stringify({ dreamModel: { provider: inherited.provider, model: inherited.id, thinkingLevel: "high" } }));
 	await s.emit("session_start");
 	let reopened = false;
-	s.setSelectReply(() => assert.fail("Session selection must not ask for a thinking level"));
 	s.setPanelDriver((panel, dialog) => {
 		if (dialog === 1) openModelRow(panel, "dreamModel");
 		else if (dialog === 2) panel.handleInput?.("\r");
@@ -1374,10 +1379,10 @@ test("choosing to follow the session thinking level removes a previously configu
 	s.registerModel(model);
 	await saveJobModel(s.cwd, "extractModel", { provider: model.provider, model: model.id, thinkingLevel: "high" });
 	await s.emit("session_start");
-	s.setSelectReply((items) => items[0]);
 	s.setPanelDriver((panel, dialog) => {
 		if (dialog === 1) openModelRow(panel, "extractModel");
 		else if (dialog === 2) pickModel(panel, model);
+		else if (dialog === 3) pickThinking(panel, model, "session");
 		else panel.handleInput?.("\u001b");
 	});
 	await s.command("memory");
@@ -1385,6 +1390,24 @@ test("choosing to follow the session thinking level removes a previously configu
 	await s.command("memory-extract");
 	assert.equal(s.modelRequests.at(-1)?.model, model);
 	assert.equal(s.modelRequests.at(-1)?.thinking, s.sessionThinking());
+}));
+
+test("every thinking-level choice carries a description", async () => withSession(async (s) => {
+	const model = modelFixture();
+	s.registerModel(model);
+	const choices = getSupportedThinkingLevels(model).length + 1;
+	let described = 0;
+	s.setPanelDriver((panel, dialog) => {
+		if (dialog === 1) openModelRow(panel, "extractModel");
+		else if (dialog === 2) pickModel(panel, model);
+		else if (dialog === 3) {
+			// Each row renders its label and description in separate columns.
+			described = panel.render(240).filter((line) => /\S\s{2,}\S/.test(line.trim())).length;
+			panel.handleInput?.("\u001b");
+		} else panel.handleInput?.("\u001b");
+	});
+	await s.command("memory");
+	assert.equal(described, choices);
 }));
 
 test("RPC settings summary delivers both configured model identities", async () => withSession(async (s) => {
@@ -1411,11 +1434,11 @@ test("a failed model-setting save reopens the panel and keeps the active selecti
 	await s.emit("session_start");
 	const file = path.join(s.cwd, ".pi", "memory.json"), malformed = `{${crypto.randomUUID()}`;
 	fs.writeFileSync(file, malformed);
-	s.setSelectReply(() => "high");
 	let reopened = false;
 	s.setPanelDriver((panel, dialog) => {
 		if (dialog === 1) openModelRow(panel, "extractModel");
 		else if (dialog === 2) pickModel(panel, candidate);
+		else if (dialog === 3) pickThinking(panel, candidate, "high");
 		else {
 			reopened = true;
 			assert.ok(panel.render(240).join("\n").includes(original.id));

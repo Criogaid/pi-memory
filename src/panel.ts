@@ -2,7 +2,7 @@
  * and dialog lifetime. This adapter keeps the dialog open and rolls displayed
  * values back after a failed save; settings persistence remains in persistence.ts.
  */
-import { getSupportedThinkingLevels, type Api, type Model } from "@earendil-works/pi-ai";
+import { getSupportedThinkingLevels, type Api, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { getSelectListTheme, getSettingsListTheme, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Container, fuzzyFilter, Input, SelectList, SettingsList, Text, type SettingItem } from "@earendil-works/pi-tui";
 import {
@@ -126,6 +126,16 @@ export async function showMemoryPanel(ctx: ExtensionContext, controls: {
 const SESSION_MODEL_CHOICE = "Use the session model";
 const SESSION_THINKING_CHOICE = "Follow the session";
 const MAX_VISIBLE_MODELS = 10;
+// Mirrors pi's /thinking selector wording so both menus describe levels alike; pi does not export it.
+const THINKING_LEVEL_DESCRIPTIONS: Readonly<Record<ModelThinkingLevel, string>> = {
+	off: "No reasoning",
+	minimal: "Very brief reasoning (~1k tokens)",
+	low: "Light reasoning (~2k tokens)",
+	medium: "Moderate reasoning (~8k tokens)",
+	high: "Deep reasoning (~16k tokens)",
+	xhigh: "Extra-high reasoning (~32k tokens)",
+	max: "Maximum reasoning",
+};
 
 function modelLabel(model: Model<Api>): string {
 	return `${model.provider}/${model.id} (${model.name})`;
@@ -169,9 +179,28 @@ export async function chooseJobModel(ctx: ExtensionContext, key: JobModelKey): P
 		};
 	});
 	if (model === null || model === undefined) return model;
+	const thinking = await chooseThinkingLevel(ctx, model);
+	if (thinking === undefined) return undefined;
+	return { provider: model.provider, model: model.id, ...(thinking === "session" ? {} : { thinkingLevel: thinking }) };
+}
+
+/** "session" means follow the session's thinking level; undefined means the user cancelled. */
+async function chooseThinkingLevel(ctx: ExtensionContext, model: Model<Api>): Promise<ModelThinkingLevel | "session" | undefined> {
 	const levels = getSupportedThinkingLevels(model);
-	const chosen = await ctx.ui.select(`Thinking level for ${model.provider}/${model.id}`, [SESSION_THINKING_CHOICE, ...levels]);
-	if (chosen === undefined) return undefined;
-	const thinkingLevel = levels.find((level) => level === chosen);
-	return { provider: model.provider, model: model.id, ...(thinkingLevel ? { thinkingLevel } : {}) };
+	return ctx.ui.custom<ModelThinkingLevel | "session" | undefined>((tui, _theme, _keys, done) => {
+		const list = new SelectList([
+			{ value: "session", label: SESSION_THINKING_CHOICE, description: "Use the chat's thinking level when each job starts, limited to this model's levels" },
+			...levels.map((level) => ({ value: level, label: level, description: THINKING_LEVEL_DESCRIPTIONS[level] })),
+		], levels.length + 1, getSelectListTheme());
+		list.onSelect = (item) => done(item.value === "session" ? "session" : levels.find((level) => level === item.value));
+		list.onCancel = () => done(undefined);
+		const container = new Container();
+		container.addChild(new Text(`Thinking level for ${model.provider}/${model.id}`, 0, 0));
+		container.addChild(list);
+		return {
+			render: (width) => container.render(width),
+			invalidate: () => container.invalidate(),
+			handleInput: (data) => { list.handleInput(data); tui.requestRender(); },
+		};
+	});
 }

@@ -76,7 +76,6 @@ function mkCtx(opts: { reply?: () => Promise<Partial<AssistantMessage>> } = {}) 
 		ui: {
 			notify: (m: string) => console.log("  [notify]", String(m).split("\n")[0]),
 			setStatus: () => {},
-			select: async (_t: string, items: string[]) => items[0],
 		},
 		sessionManager: {
 			buildContextEntries: () => branch,
