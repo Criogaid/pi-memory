@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { test } from "node:test";
 import { fork } from "node:child_process";
 import { once } from "node:events";
-import { SessionManager, type ExtensionAPI, type ExtensionContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { createEditTool, createWriteTool, SessionManager, type ExtensionAPI, type ExtensionContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { BeforeAgentStartEventResult } from "@earendil-works/pi-coding-agent";
 import type { Context } from "@earendil-works/pi-ai";
 import factory from "../src/index.ts";
@@ -13,7 +13,8 @@ import { LIMITS, loadConfig, resolvePaths } from "../src/config.ts";
 import { readDreamState } from "../src/dream.ts";
 import { applyExtractOps, collectEntriesSince } from "../src/extract.ts";
 import { parseMemory, serializeMemory } from "../src/frontmatter.ts";
-import { listMemories } from "../src/store.ts";
+import { listMemories, truncateMemory } from "../src/store.ts";
+import { MemoryJobs, type MemoryJobRequest } from "../src/workflow.ts";
 
 type Handler = (event: unknown, ctx: ExtensionContext) => unknown | Promise<unknown>;
 interface Command { handler: (args: string, ctx: ExtensionContext) => unknown | Promise<unknown>; }
@@ -83,7 +84,7 @@ async function createSession() {
 	};
 	await emit("session_start");
 	return {
-		root, cwd, config, paths: resolvePaths(cwd, config), manager, notifications, emit, command, save, turn,
+		root, cwd, ctx, config, paths: resolvePaths(cwd, config), manager, notifications, emit, command, save, turn,
 		modelCalls: () => modelCalls,
 		parentRule,
 		activeTools: () => activeTools,
@@ -102,6 +103,39 @@ async function createSession() {
 
 function memory(name: string, body: string, pinned = false) {
 	return serializeMemory({ name, description: `description ${name}`, type: "project", pinned, originSessionId: "test", modified: new Date().toISOString() }, body);
+}
+
+function runMemoryJob(s: Awaited<ReturnType<typeof createSession>>, kind: MemoryJobRequest["kind"]) {
+	return new MemoryJobs().run(s.ctx, {
+		kind, paths: s.paths, sessionId: s.manager.getSessionId(),
+		systemPrompt: s.parentRule, prompt: crypto.randomUUID(),
+	});
+}
+
+function modelReadResults(request: Context): readonly unknown[] {
+	const message = request.messages.at(-1);
+	assert.ok(message?.role === "user" && typeof message.content === "string");
+	const reply: unknown = JSON.parse(message.content);
+	assert.ok(typeof reply === "object" && reply !== null && "files" in reply && Array.isArray(reply.files));
+	return reply.files;
+}
+
+async function changeMemoryWithBuiltin(s: Awaited<ReturnType<typeof createSession>>, toolName: "write" | "edit", content: string) {
+	const file = path.join(s.paths.personalDir, `${crypto.randomUUID()}.md`);
+	const updated = `${content}\n${crypto.randomUUID()}`;
+	if (toolName === "write") {
+		const input = { path: file, content: updated };
+		assert.equal(await s.emit("tool_call", { toolName, input }), undefined);
+		await createWriteTool(s.cwd).execute(crypto.randomUUID(), input);
+		await s.emit("tool_result", { toolName, input, isError: false });
+	} else {
+		fs.writeFileSync(file, content);
+		const input = { path: file, edits: [{ oldText: content, newText: updated }] };
+		assert.equal(await s.emit("tool_call", { toolName, input }), undefined);
+		await createEditTool(s.cwd).execute(crypto.randomUUID(), input);
+		await s.emit("tool_result", { toolName, input, isError: false });
+	}
+	return parseMemory(fs.readFileSync(file, "utf8"));
 }
 
 test("same-basename projects have isolated personal memory", async () => withSession(async (s) => {
@@ -708,3 +742,133 @@ test("Dream waiting for foreground idle cannot start in a replacement session", 
 	assert.equal(s.modelCalls(), 0);
 	assert.equal(readDreamState(s.paths).lastAttemptAt, null);
 }));
+
+for (const target of ["missing", "directory", "image"] as const) {
+	test(`Dream returns project read errors for ${target} targets and completes later operations`, async () => withSession(async (s) => {
+		const file = target === "image" ? "evidence.png" : target;
+		if (target === "directory") fs.mkdirSync(path.join(s.cwd, file));
+		if (target === "image") {
+			// A real PNG makes Pi's read tool return an image attachment.
+			fs.writeFileSync(path.join(s.cwd, file), Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64"));
+		}
+		const payload = crypto.randomUUID();
+		fs.writeFileSync(path.join(s.cwd, "available.txt"), payload);
+		let received: readonly unknown[] | undefined;
+		s.setModelReply((request) => {
+			if (s.modelCalls() === 1) return JSON.stringify({ readProject: [file, "available.txt"] });
+			received = modelReadResults(request);
+			return JSON.stringify({ ops: [{ op: "upsert", file: "recovered.md", type: "project", description: payload, body: payload }] });
+		});
+		const result = await runMemoryJob(s, "dream");
+		assert.ok(received);
+		const failed = received.find((entry) => typeof entry === "object" && entry !== null && "path" in entry && entry.path === file);
+		assert.ok(typeof failed === "object" && failed !== null && "error" in failed && typeof failed.error === "string");
+		const available = received.find((entry) => typeof entry === "object" && entry !== null && "path" in entry && entry.path === "available.txt");
+		assert.ok(typeof available === "object" && available !== null && "content" in available && available.content === payload);
+		assert.equal(result.status, "completed");
+		assert.equal(result.applied, 1);
+		assert.equal(parseMemory(fs.readFileSync(path.join(s.paths.personalDir, "recovered.md"), "utf8")).body.trim(), payload);
+	}));
+}
+
+for (const boundary of ["absolute", "parent", "missing-parent", "linked", "missing-linked"] as const) {
+	test(`Dream enforces project read boundaries for ${boundary} paths`, async () => withSession(async (s) => {
+		const outside = path.join(s.root, "outside");
+		fs.mkdirSync(outside);
+		fs.writeFileSync(path.join(outside, "private.txt"), crypto.randomUUID());
+		fs.writeFileSync(path.join(s.cwd, "inside.txt"), crypto.randomUUID());
+		if (boundary.includes("linked")) fs.symlinkSync(outside, path.join(s.cwd, "linked"), "junction");
+		const files = {
+			absolute: path.join(s.cwd, "inside.txt"),
+			parent: "../outside/private.txt",
+			"missing-parent": "../outside/missing.txt",
+			linked: "linked/private.txt",
+			"missing-linked": "linked/missing.txt",
+		};
+		s.setModelReply(() => s.modelCalls() === 1
+			? JSON.stringify({ readProject: [files[boundary]] })
+			: JSON.stringify({ ops: [{ op: "upsert", file: "forbidden.md", type: "project", description: "boundary", body: crypto.randomUUID() }] }));
+		const result = await runMemoryJob(s, "dream");
+		assert.equal(result.status, "failed");
+		assert.equal(s.modelCalls(), 1);
+		assert.equal(result.applied, 0);
+		assert.equal(fs.existsSync(path.join(s.paths.personalDir, "forbidden.md")), false);
+	}));
+}
+
+for (const kind of ["dream", "extract"] as const) {
+	for (const writeInvalid of [false, true]) {
+		test(`${kind} reports invalid memory references and ${writeInvalid ? "rejects their writes" : "continues with valid operations"}`, async () => withSession(async (s) => {
+			await s.save("retained", { body: crypto.randomUUID() });
+			const indexFile = path.join(s.paths.personalDir, "MEMORY.md");
+			const original = fs.readFileSync(indexFile, "utf8");
+			const payload = crypto.randomUUID();
+			let received: readonly unknown[] | undefined;
+			s.setModelReply((request) => {
+				if (s.modelCalls() === 1) return JSON.stringify({ read: ["MEMORY.md"] });
+				received = modelReadResults(request);
+				return JSON.stringify({ ops: [{ op: "upsert", file: writeInvalid ? "MEMORY.md" : "recovered.md", type: "project", description: payload, body: payload }] });
+			});
+			const result = await runMemoryJob(s, kind);
+			assert.ok(received);
+			const failed = received.find((entry) => typeof entry === "object" && entry !== null && "ref" in entry && entry.ref === "MEMORY.md");
+			assert.ok(typeof failed === "object" && failed !== null && "error" in failed && typeof failed.error === "string");
+			if (writeInvalid) {
+				assert.equal(result.status, "failed");
+				assert.equal(result.applied, 0);
+				assert.equal(fs.readFileSync(indexFile, "utf8"), original);
+			} else {
+				assert.equal(result.status, "completed");
+				assert.equal(result.applied, 1);
+				assert.equal(parseMemory(fs.readFileSync(path.join(s.paths.personalDir, "recovered.md"), "utf8")).body.trim(), payload);
+			}
+		}));
+	}
+}
+
+for (const toolName of ["write", "edit"] as const) {
+	test(`${toolName} provenance refresh preserves replacement metacharacters in frontmatter values`, async () => withSession(async (s) => {
+		const name = crypto.randomUUID();
+		const description = ["$$", "$&", "$`", "$'"].map((token) => `${crypto.randomUUID()}${token}`).join(" ");
+		const origin = crypto.randomUUID(), body = crypto.randomUUID();
+		const oldModified = new Date(0).toISOString();
+		const content = `---\nname: ${JSON.stringify(name)}\ndescription: ${JSON.stringify(description)}\nmetadata:\n  originSessionId: ${JSON.stringify(origin)}\n  modified: ${JSON.stringify(oldModified)}\n  type: feedback\n  pinned: true\n---\n\n${body}`;
+		const started = Date.now();
+		const result = await changeMemoryWithBuiltin(s, toolName, content);
+		assert.equal(result.frontmatter.name, name);
+		assert.equal(result.frontmatter.description, description);
+		assert.equal(result.frontmatter.originSessionId, origin);
+		assert.equal(result.frontmatter.type, "feedback");
+		assert.equal(result.frontmatter.pinned, true);
+		assert.ok(result.frontmatter.modified !== null && Date.parse(result.frontmatter.modified) >= started);
+		assert.ok(result.body.includes(body));
+	}));
+
+	test(`${toolName} inserts missing provenance timestamps without losing nested memory metadata`, async () => withSession(async (s) => {
+		const origin = crypto.randomUUID(), body = crypto.randomUUID();
+		const content = `---\nname: ${crypto.randomUUID()}\ndescription: ${crypto.randomUUID()}\nmetadata:\n  originSessionId: ${JSON.stringify(origin)}\n  type: project\n  pinned: true\n---\n\n${body}`;
+		const started = Date.now();
+		const result = await changeMemoryWithBuiltin(s, toolName, content);
+		assert.equal(result.frontmatter.originSessionId, origin);
+		assert.equal(result.frontmatter.type, "project");
+		assert.equal(result.frontmatter.pinned, true);
+		assert.ok(result.frontmatter.modified !== null && Date.parse(result.frontmatter.modified) >= started);
+		assert.ok(result.body.includes(body));
+	}));
+}
+
+for (const [encoding, unit] of [["ASCII", crypto.randomUUID()], ["multibyte", "记忆"], ["surrogate pairs", "🧠"]]) {
+	test(`single-line ${encoding} memory retains the longest prefix within the byte limit`, async () => withSession(async (s) => {
+		const maxBytes = 4096;
+		for (const padding of [0, 1, 2, 3]) {
+			const raw = "x".repeat(padding) + unit.repeat(maxBytes);
+			const rendered = truncateMemory(raw, path.join(s.paths.personalDir, "long.md"), maxBytes);
+			// Compare the input prefix without depending on the appended truncation notice.
+			let retainedLength = 0;
+			while (retainedLength < raw.length && raw[retainedLength] === rendered[retainedLength]) retainedLength++;
+			assert.ok(retainedLength > 0 && retainedLength < raw.length);
+			assert.ok(Buffer.byteLength(raw.slice(0, retainedLength), "utf8") <= maxBytes);
+			assert.ok(Buffer.byteLength(raw.slice(0, retainedLength + 1), "utf8") > maxBytes);
+		}
+	}));
+}
