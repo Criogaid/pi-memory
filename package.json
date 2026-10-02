@@ -1,0 +1,17 @@
+{
+  "name": "pi-memory",
+  "version": "0.2.0",
+  "description": "Claude Code-style auto memory for pi: file-based memories with a MEMORY.md index, pinned memories, recall injection, sandboxed background extraction, dream consolidation, /memory and /pause-memory commands.",
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.84.2 <0.86",
+    "@earendil-works/pi-ai": ">=0.84.2 <0.86",
+    "@earendil-works/pi-tui": ">=0.84.2 <0.86",
+    "typebox": "*"
+  }
+}

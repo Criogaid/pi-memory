@@ -1,0 +1,6 @@
+# Ignore dot-prefixed directories at every depth.
+.*/
+
+# Local dependencies and generated build output.
+node_modules/
+dist/
