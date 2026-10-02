@@ -132,30 +132,27 @@ function formatBytes(bytes: number): string {
 }
 
 export function readMemoryFile(absolutePath: string, maxBytes = LIMITS.fileMaxBytes): string | null {
-	try {
-		const raw = fs.readFileSync(absolutePath, "utf-8");
-		// Claude Code caps recall rendering at jEe=200 lines and ZX=4096 bytes
-		// (chr/RB with truncateOnByteLimit): the byte limit counts real UTF-8
-		// bytes, and the truncation note names one reason — the byte limit when
-		// it fired, otherwise the line limit.
-		const lines = raw.split("\n");
-		let clipped = raw;
-		let byteTruncated = false;
-		if (lines.length > LIMITS.recallMaxLines) clipped = lines.slice(0, LIMITS.recallMaxLines).join("\n");
-		if (Buffer.byteLength(clipped, "utf-8") > maxBytes) {
-			clipped = sliceToByteLimit(clipped, maxBytes);
-			byteTruncated = true;
-		}
-		if (lines.length <= LIMITS.recallMaxLines && !byteTruncated) return raw;
-		const reason = byteTruncated ? `${maxBytes} byte limit` : `first ${LIMITS.recallMaxLines} lines`;
-		return (
-			clipped +
-			`\n\n> This memory file was truncated (${reason}). ` +
-			`Use the read tool to view the complete file at: ${absolutePath}`
-		);
-	} catch {
-		return null;
+	const raw = readFileOrNull(absolutePath);
+	return raw === null ? null : truncateMemory(raw, absolutePath, maxBytes);
+}
+
+/** Render and hash the same read snapshot so external edits cannot mismatch revisions. */
+export function truncateMemory(raw: string, absolutePath: string, maxBytes = LIMITS.fileMaxBytes): string {
+	const lines = raw.split("\n");
+	let clipped = raw;
+	let byteTruncated = false;
+	if (lines.length > LIMITS.recallMaxLines) clipped = lines.slice(0, LIMITS.recallMaxLines).join("\n");
+	if (Buffer.byteLength(clipped, "utf-8") > maxBytes) {
+		clipped = sliceToByteLimit(clipped, maxBytes);
+		byteTruncated = true;
 	}
+	if (lines.length <= LIMITS.recallMaxLines && !byteTruncated) return raw;
+	const reason = byteTruncated ? `${maxBytes} byte limit` : `first ${LIMITS.recallMaxLines} lines`;
+	return (
+		clipped +
+		`\n\n> This memory file was truncated (${reason}). ` +
+		`Use the read tool to view the complete file at: ${absolutePath}`
+	);
 }
 
 /** Longest prefix of `text` that fits in `maxBytes` UTF-8 bytes. */

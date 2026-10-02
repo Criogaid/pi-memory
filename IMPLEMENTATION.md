@@ -23,7 +23,8 @@ Enterprise services, paid semantic retrieval, replacing pi's instruction loader,
 | --- | --- | --- |
 | Baseline and design | Complete | Initial commit `159236d`; pi 0.85.1 docs and session-state example inspected; original E2E and strict check passed |
 | Correctness and persistence | Complete | Nine regression cases failed before changes; all 14 current regressions plus original E2E, strict/no-unused TypeScript checks and diff checks pass |
-| Recall state and freshness | Pending | Use pi custom-message details plus active branch/context entries |
+| Recall state and freshness | Complete | 22 behavior regressions and cleaned lifecycle acceptance pass; real session branches/compaction drive recall restoration; freshness preserves the system prefix |
+| npm toolchain | Complete | Locked pi 0.85.1 development dependencies; Node runner with pi's Jiti dependency; npm check and both test suites pass |
 | Extraction workflow | Pending | Use modelRegistry.complete with bounded validated operations and full existing content |
 | Dream lifecycle and settings | Pending | Share the model/mutation boundary with extraction |
 | Final audit and documentation | Pending | Audit every acceptance item against tests and final code |
@@ -48,7 +49,7 @@ Enterprise services, paid semantic retrieval, replacing pi's instruction loader,
 
 ## Verification log
 
-Commands: `bun run check`, `bun run test`, `tsc -p tsconfig.json --noUnusedLocals --noUnusedParameters`, `git diff --check`.
+Commands: `npm run check`, `npm test`, `tsc -p tsconfig.json --noUnusedLocals --noUnusedParameters`, `git diff --check`.
 
 First implementation milestone: 14 regression tests pass plus the original E2E acceptance script. Added real SessionManager compaction, parallel saves, pi builtin writes, path alias containment, conflict-safe promotion, explicit legacy import, and junction escape checks. Nine core cases failed against the initial code. All tests use temporary roots and mocked model completion.
 
@@ -58,4 +59,12 @@ Portable npm scripts and dev dependency declarations replace the machine-specifi
 
 ## Next action
 
-Implement branch-aware session state and recall freshness next. Restore pause/cursor from `getBranch()` (current restore still scans all entries); restore surfaced-memory revisions/budget from active context custom messages. Add actual branch/compaction tests, changed/deleted memory notices, and stable system-prefix checks. Then replace the background extraction lifecycle and manual Dream with the bounded shared workflow. Keep manual import from invalidating the existing session's stable prompt prefix.
+Replace extraction and Dream with the bounded shared workflow, using pi public APIs for model calls, session context, queues, and lifecycle. Do not reintroduce prompt or diagnostic wording tests. Use npm for all repository commands.
+
+## Recall milestone evidence and user constraints
+
+Recall stores versioned revisions and byte usage on the actual injected custom message. Each turn restores them from `buildContextEntries`; pause and extraction cursors restore from `getBranch`. Snapshot and recalled files produce changed/deleted updates, while the system prefix stays fixed. File rendering and hashing use the same read snapshot. Budget exhaustion allows invalidation without additional bodies. Pins beyond the injected cap remain recall candidates.
+
+The user explicitly prohibited literal-pinning and wording tests. Removed prompt prose, UI labels, YAML ordering, reason strings, and diagnostic phrasing assertions. Recall data-delivery tests use generated payloads. Keep behavior assertions only.
+
+The user requires npm exclusively. Node's built-in test runner uses Jiti 2.7.0, also used by pi's extension loader. The lockfile pins a standalone development installation to pi 0.85.1. npm run check, npm test (22 regressions plus lifecycle acceptance), and the no-unused TypeScript check pass. The user also requires reuse of pi infrastructure; inspect public host APIs before implementing missing lifecycle behavior.

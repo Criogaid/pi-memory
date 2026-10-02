@@ -32,6 +32,7 @@ import {
 	serializeConversation,
 	withFileMutationQueue,
 	type ExtensionAPI,
+	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { join as pathJoin } from "node:path";
@@ -161,6 +162,7 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 		const pinned = buildPinnedSection(listMemories(paths), (abs) => readFileOrNull(abs));
 		if (pinned) snapshot += "\n\n" + pinned;
 		memoryPromptSnapshot = snapshot;
+		recallSession.snapshot(paths);
 	};
 
 	/** Active branch with compaction applied — what the model actually sees. */
@@ -172,6 +174,20 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 		const serialized = serializeConversation(convertToLlm(messages as never[]));
 		if (serialized.length <= TRANSCRIPT_MAX_CHARS) return serialized;
 		return serialized.slice(serialized.length - TRANSCRIPT_MAX_CHARS);
+	};
+
+	// State follows selected ancestry; recall follows visible context after compaction.
+	const restoreBranchState = (ctx: ExtensionContext) => {
+		paused = false;
+		lastExtractedId = null;
+		directWriteSinceExtract = false;
+		for (const entry of ctx.sessionManager.getBranch()) {
+			if (entry.type !== "custom" || typeof entry.data !== "object" || entry.data === null) continue;
+			if (entry.customType === "pi-memory:extracted" && "lastExtractedId" in entry.data && typeof entry.data.lastExtractedId === "string")
+				lastExtractedId = entry.data.lastExtractedId;
+			if (entry.customType === "pi-memory:state" && "paused" in entry.data && typeof entry.data.paused === "boolean")
+				paused = entry.data.paused;
+		}
 	};
 
 	/** Run the gated extraction flow; returns a human-readable result line. */
@@ -259,21 +275,7 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 		} catch {
 			// keep the generated id
 		}
-		// Restore the extraction cursor, recall state, and the paused flag from
-		// persisted custom entries (Claude Code persists pause via session
-		// internal metadata — this is the pi equivalent).
-		for (const entry of ctx.sessionManager.getEntries() as EntryLike[]) {
-			if (entry?.type !== "custom") continue;
-			if (entry.customType === "pi-memory:extracted") {
-				const cursor = entry.data?.lastExtractedId;
-				if (typeof cursor === "string") lastExtractedId = cursor;
-			}
-			if (entry.customType === "pi-memory:state" && typeof entry.data?.paused === "boolean") {
-				// Entries iterate in write order, so the LAST state entry wins
-				// (on→off must restore as off, not stay on).
-				paused = entry.data.paused;
-			}
-		}
+		restoreBranchState(ctx);
 		snapshotMemoryPrompt();
 		debug("session_start: snapshot chars:", memoryPromptSnapshot.length, "cursor:", lastExtractedId);
 		setStatus(ctx, statusText());
@@ -319,20 +321,26 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 		return memories.length > 0 ? Math.max(...memories.map((m) => m.mtimeMs)) : 0;
 	};
 
+	pi.on("session_tree", async (_event, ctx) => {
+		restoreBranchState(ctx);
+		setStatus(ctx, statusText());
+	});
+
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (!enabled) return;
 		setStatus(ctx, statusText());
 
 		if (config.recall && !paused && event.prompt.trim() && !isDreamPrompt(event.prompt)) {
+			recallSession.restore(ctx.sessionManager.buildContextEntries());
 			const result = recallForPrompt(paths, event.prompt, recallSession, config.citeMemories);
 			if (result.reminder) {
-				recallSession.mark(result.refs, result.bytes);
 				return {
 					systemPrompt: event.systemPrompt + (memoryPromptSnapshot ? "\n\n" + memoryPromptSnapshot : ""),
 					message: {
 						customType: "pi-memory:recall",
 						content: result.reminder,
 						display: false,
+						details: result.details,
 					},
 				};
 			}
@@ -562,7 +570,6 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 					if (result.ok) imported++;
 				}
 				ctx.ui.notify(`Imported ${imported} of ${files.length} legacy memories. Existing targets and all legacy files were preserved.`, "info");
-				snapshotMemoryPrompt();
 				return;
 			}
 			const memories = listMemories(paths);

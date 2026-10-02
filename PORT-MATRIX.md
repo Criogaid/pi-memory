@@ -20,9 +20,9 @@ Use **copied** for prompt text/constants, **adapted** for equivalent intent thro
 | Recall ranking | `pretty/m0354.js:149547` `LBt`, `149631` `Ssr` | Keyword/stem/CJK scoring | Intentional substitute |
 | Recall prefetch | `pretty/m0354.js:150887` `z4n` | Synchronous recall during `before_agent_start` | Omitted |
 | Internal Dream recall exclusion | `pretty/m0354.js:150885` `Vsr` | Dream prompt detection is wired into recall | Adapted for the current injected task |
-| Recall freshness/state | `pretty/m0354.js:104794`, `150849` | Session-local surfaced set; no changed/deleted refresh or branch restoration | Partial |
+| Recall freshness/state | `pretty/m0354.js:104794`, `150849` | Message revisions/budget restore from visible context; changed/deleted snapshot and recalled content refresh | Adapted |
 | Seeded unchanged reads | `pretty/m0354.js:117872` | No shared read-state cache with pi's read tool | Omitted |
-| Pause | `pretty/m0169.js:9669`; `pretty/m0354.js:92635` | Resolved tool path checks; structured save/extract/promote commands respect pause | Adapted |
+| Pause | `pretty/m0169.js:9669`; `pretty/m0354.js:92635` | Selected ancestry restores pause; resolved tool paths and structured commands respect it | Adapted |
 | Memory panel | `pretty/m1646.js:1042` | Session toggles, manual extract/dream, open folders | Partial; no persisted Auto-dream switch/true last-run status |
 | Dream prompt | `pretty/m0354.js:106900` `iEt` and team/AGENTS reconciliation | Four-stage guidance adapted to pi transcripts | Adapted text |
 | Dream execution | `pretty/m0354.js:107051`, `87117` | Manual main-conversation prompt plus approximate reminder based on memory mtime | Partial; no restricted task, cross-process lock, or actual completion record |
@@ -34,4 +34,4 @@ Use **copied** for prompt text/constants, **adapted** for equivalent intent thro
 
 ## Verification
 
-`bun run check` type-checks the plugin and tests. `bun run test` runs observable-behavior regressions and the original lifecycle acceptance script. Tests verify the local implementation, not execution inside the original Claude Code binary. Implementation progress and remaining acceptance requirements live in `IMPLEMENTATION.md`.
+`npm run check` type-checks the plugin and tests. `npm test` runs observable-behavior regressions and the original lifecycle acceptance script. Tests verify the local implementation, not execution inside the original Claude Code binary. Implementation progress and remaining acceptance requirements live in `IMPLEMENTATION.md`.

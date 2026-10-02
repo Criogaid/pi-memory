@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
 import { SessionManager, type ExtensionAPI, type ExtensionContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { BeforeAgentStartEventResult } from "@earendil-works/pi-coding-agent";
 import factory from "../src/index.ts";
 import { LIMITS, resolvePaths } from "../src/config.ts";
 import { applyExtractOps, collectEntriesSince } from "../src/extract.ts";
@@ -62,9 +63,15 @@ async function createSession() {
 		assert.ok(tool);
 		return tool.execute(name, { name, type: "feedback", description: "Durable preference", body: "Preserve prior knowledge", ...extra }, undefined, undefined, ctx);
 	};
+	const turn = async (prompt: string) => {
+		manager.appendMessage({ role: "user", content: prompt, timestamp: Date.now() });
+		const result = await emit("before_agent_start", { prompt, systemPrompt: "BASE" }) as BeforeAgentStartEventResult | undefined;
+		if (result?.message) manager.appendCustomMessageEntry(result.message.customType, result.message.content, result.message.display, result.message.details);
+		return result;
+	};
 	await emit("session_start");
 	return {
-		root, cwd, config, paths: resolvePaths(cwd, config), manager, notifications, emit, command, save,
+		root, cwd, config, paths: resolvePaths(cwd, config), manager, notifications, emit, command, save, turn,
 		modelCalls: () => modelCalls,
 		addUser: (text: string) => manager.appendMessage({ role: "user", content: text, timestamp: Date.now() }),
 		close: async () => {
@@ -218,4 +225,123 @@ test("structured writes cannot follow a memory-directory junction outside its ro
 	fs.symlinkSync(outside, path.join(s.paths.teamDir, "escape"), "junction");
 	await assert.rejects(() => applyExtractOps(s.paths, [{ op: "upsert", file: "team/escape/file.md", type: "project", description: "Outside", body: "Must not escape" }], "test"));
 	assert.equal(fs.existsSync(path.join(outside, "file.md")), false);
+}));
+
+test("recall deduplication follows persisted visible messages across reload and branch changes", async () => withSession(async (s) => {
+	const rootEntry = s.addUser("Start here");
+	const payload = crypto.randomUUID();
+	fs.writeFileSync(path.join(s.paths.personalDir, "deployment.md"), memory("deployment", payload));
+	const first = await s.turn("Explain deployment procedures");
+	assert.ok(String(first?.message?.content).includes(payload));
+	await s.emit("session_start");
+	assert.equal((await s.turn("Explain deployment procedures"))?.message, undefined);
+	s.manager.branch(rootEntry);
+	await s.emit("session_tree");
+	assert.ok(String((await s.turn("Explain deployment procedures"))?.message?.content).includes(payload));
+}));
+
+test("compaction restores recall eligibility for discarded attachments", async () => withSession(async (s) => {
+	const payload = crypto.randomUUID();
+	fs.writeFileSync(path.join(s.paths.personalDir, "deployment.md"), memory("deployment", payload));
+	await s.turn("Explain deployment procedures");
+	const kept = s.addUser("Context retained after compaction");
+	s.manager.appendCompaction("Previous work summary", kept, 500);
+	await s.emit("session_compact");
+	assert.ok(String((await s.turn("Explain deployment procedures"))?.message?.content).includes(payload));
+}));
+
+test("changed and deleted recalled files invalidate old context without keyword matches", async () => withSession(async (s) => {
+	const file = path.join(s.paths.personalDir, "deployment.md");
+	const original = crypto.randomUUID();
+	const updated = crypto.randomUUID();
+	fs.writeFileSync(file, memory("deployment", original));
+	await s.turn("Explain deployment procedures");
+	fs.writeFileSync(file, memory("deployment", updated));
+	const changed = await s.turn("ok");
+	assert.ok(String(changed?.message?.content).includes(updated));
+	assert.ok(!String(changed?.message?.content).includes(original));
+	assert.equal((await s.turn("ok"))?.message, undefined);
+	fs.unlinkSync(file);
+	assert.ok((await s.turn("ok"))?.message);
+	assert.equal((await s.turn("ok"))?.message, undefined);
+}));
+
+test("pinned and index changes refresh context without changing the system prefix", async () => withSession(async (s) => {
+	const file = path.join(s.paths.personalDir, "policy.md");
+	const original = crypto.randomUUID();
+	const updated = crypto.randomUUID();
+	const indexContent = crypto.randomUUID();
+	fs.writeFileSync(file, memory("policy", original, true));
+	await s.emit("session_start");
+	const first = await s.turn("hello");
+	fs.writeFileSync(file, memory("policy", updated, true));
+	fs.writeFileSync(path.join(s.paths.personalDir, "MEMORY.md"), indexContent);
+	const changed = await s.turn("ok");
+	assert.equal(changed?.systemPrompt, first?.systemPrompt);
+	assert.ok(String(changed?.message?.content).includes(updated));
+	assert.ok(String(changed?.message?.content).includes(indexContent));
+}));
+
+test("pause and extraction cursors follow selected ancestry", async () => withSession(async (s) => {
+	const rootEntry = s.addUser("Root");
+	await s.command("pause-memory");
+	const pausedLeaf = s.manager.getLeafId();
+	assert.ok(pausedLeaf);
+	s.manager.branch(rootEntry);
+	await s.emit("session_tree");
+	assert.equal("isError" in await s.save("branch-safe"), false);
+	s.manager.branch(pausedLeaf);
+	await s.emit("session_tree");
+	const blocked = await s.save("blocked-on-old-branch");
+	assert.ok("isError" in blocked && blocked.isError === true);
+	s.manager.branch(rootEntry);
+	await s.emit("session_start");
+	s.addUser("Please remember this durable branch preference");
+	await s.emit("agent_settled");
+	assert.equal(s.modelCalls(), 1);
+}));
+
+test("pins outside the system snapshot remain eligible for recall", async () => withSession(async (s) => {
+	const payloads = Array.from({ length: LIMITS.maxPinned + 1 }, () => crypto.randomUUID());
+	for (const [index, payload] of payloads.entries())
+		fs.writeFileSync(path.join(s.paths.personalDir, `policy-${index}.md`), memory(`policy-${index}`, payload, true));
+	await s.emit("session_start");
+	const result = await s.turn("Explain policy guidelines");
+	assert.ok(result?.message);
+	const context = `${result.systemPrompt}\n${result.message.content}`;
+	assert.ok(payloads.every((payload) => context.includes(payload)));
+}));
+
+test("recall budget survives reload while exhausted context still invalidates changed files", async () => withSession(async (s) => {
+	const payload = crypto.randomUUID().repeat(100);
+	const count = Math.ceil(LIMITS.recallSessionBudgetBytes / payload.length) + LIMITS.recallMaxFiles;
+	for (let i = 0; i < count; i++)
+		fs.writeFileSync(path.join(s.paths.personalDir, `policy-${i}.md`), memory(`policy-${i}`, payload));
+	const recalled: string[] = [];
+	for (let i = 0; i < count; i++) {
+		const result = await s.turn("Explain policy guidelines");
+		if (!result?.message) break;
+		recalled.push(String(result.message.content));
+	}
+	assert.ok(recalled.length > 0);
+	assert.ok(recalled.join("").split(payload).length - 1 < count);
+	await s.emit("session_start");
+	assert.equal((await s.turn("Explain policy guidelines"))?.message, undefined);
+	const selected = fs.readdirSync(s.paths.personalDir).find((ref) => recalled.some((text) => text.includes(ref)));
+	assert.ok(selected);
+	const updated = crypto.randomUUID().repeat(100);
+	fs.writeFileSync(path.join(s.paths.personalDir, selected), memory(selected.replace(/\.md$/, ""), updated));
+	const invalidated = await s.turn("ok");
+	assert.ok(invalidated?.message);
+	assert.ok(!String(invalidated.message.content).includes(updated));
+	assert.equal((await s.turn("ok"))?.message, undefined);
+}));
+
+test("extraction restores its consumed cursor after session reload", async () => withSession(async (s) => {
+	s.addUser("Please retain this durable preference");
+	await s.emit("agent_settled");
+	assert.equal(s.modelCalls(), 1);
+	await s.emit("session_start");
+	await s.emit("agent_settled");
+	assert.equal(s.modelCalls(), 1);
 }));

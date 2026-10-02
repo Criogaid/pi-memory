@@ -38,9 +38,9 @@ A memory contains a name, description, `metadata.type` (`user`, `feedback`, `pro
 
 ## Behavior and guarantees
 
-The system prompt snapshots the index and pinned memories at session start to preserve its cache prefix. Recall supplies relevant content on later user turns. Internal Dream prompts are excluded from ordinary recall.
+The system prompt snapshots the index and pinned memories at session start to preserve its cache prefix. Recall supplies relevant content on later user turns. Changed or deleted memories already supplied through the snapshot or recall produce updates, including on short prompts. Internal Dream prompts are excluded from ordinary recall.
 
-The keyword selector uses stemming, full-width character folding, CJK fragments, and weak body matches. It injects at most five memories per turn with age notices and session deduplication. Limits are defined in [`LIMITS`](src/config.ts): index loading is capped at 200 lines / 25,000 characters; memory recall at 200 lines / 4,096 bytes; the session recall budget is 61,440 units; at most four pinned memories are injected. `memory_save` additionally enforces body, index, and pinned limits on writes.
+The keyword selector uses stemming, full-width character folding, CJK fragments, and weak body matches. Recall revisions and byte usage are stored with injected messages and restored from the active visible context. Branch changes and compaction therefore restore eligibility when an attachment is no longer visible. Limits are defined in [`LIMITS`](src/config.ts): index loading is capped at 200 lines / 25,000 characters; memory recall at 200 lines / 4,096 bytes; the context recall budget is 61,440 bytes; at most four pinned memories are injected. Up to five recalls or freshness updates are sent per turn. Budget exhaustion still permits invalidation notices without file bodies. Pins beyond the initial four remain eligible for recall. `memory_save` additionally enforces body, index, and pinned limits on writes.
 
 Structured saving, extraction, deletion, and promotion share one mutation owner. It validates index capacity before replacing content, checks the latest pinned count inside serialization, and rejects promotion conflicts. Built-in writes and edits share pi's per-file queue with structured writes and provenance stamping. Relative paths, home expansion, and directory boundaries are resolved before pause checks.
 
@@ -69,15 +69,16 @@ Read from `~/.pi/agent/memory/config.json`, then `<project>/.pi/memory.json`. `P
 
 [`PORT-MATRIX.md`](PORT-MATRIX.md) distinguishes copied prompt material, adapted behavior, and missing mechanisms. A matching message or constant does not establish lifecycle parity.
 
-Current intentional differences include keyword retrieval instead of a paid model selector, local files instead of enterprise stores/synchronization, pi's `AGENTS.md` loader instead of Claude Code's instruction hierarchy, and pi session JSONL instead of reference activity logs. Recall freshness/branch tracking and a bounded Dream lifecycle are being implemented under the acceptance plan in [`IMPLEMENTATION.md`](IMPLEMENTATION.md).
+Current intentional differences include keyword retrieval instead of a paid model selector, local files instead of enterprise stores/synchronization, pi's `AGENTS.md` loader instead of Claude Code's instruction hierarchy, and pi session JSONL instead of reference activity logs. Complete extraction context and a bounded Dream lifecycle are being implemented under the acceptance plan in [`IMPLEMENTATION.md`](IMPLEMENTATION.md).
 
 ## Development
 
-Install the declared development dependencies and runtime peers, or link them from an existing matching pi installation. TypeScript configuration uses project-local dependencies and contains no machine-specific paths.
+Use Node.js 22.19 or newer. Tests use Node's test runner and the same Jiti TypeScript loader dependency as pi. Install the locked dependencies with npm:
 
 ```bash
-bun run check
-bun run test
+npm ci
+npm run check
+npm test
 ```
 
-The regression suite uses real `SessionManager` history and temporary filesystem roots with a mocked model boundary. It covers project isolation, extraction after direct writes/compaction, pause containment, promotion conflicts, concurrent pin limits, rejected-save preservation, and explicit legacy import. The original lifecycle acceptance script also runs. No live model credentials or personal memory directories are required.
+The regression suite uses real `SessionManager` history and temporary filesystem roots with a mocked model boundary. It covers project isolation, extraction after direct writes/compaction, pause containment and branch state, promotion conflicts, concurrent pin limits, rejected-save preservation, explicit legacy import, recall restoration, and changed/deleted memory delivery. The lifecycle acceptance script also runs. Tests check behavior and data preservation without pinning prompt text, UI labels, or diagnostic wording. No live model credentials or personal memory directories are required.
