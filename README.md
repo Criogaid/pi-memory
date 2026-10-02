@@ -32,20 +32,25 @@ With `sharedMemory: true`, team memories live in `<project>/.pi/memory/`. The pe
 | --- | --- |
 | `memory_save` | Save one typed memory and update its index entry. |
 | `# <fact>` | Transform an interactive memory shortcut into a request to use `memory_save`. |
-| `/memory` | Open the panel with settings and last successful Dream time, or report stats in noninteractive mode. |
+| `/memory` | Open the persistent settings panel in the terminal; report state in RPC/print mode. |
 | `/memory on` / `/memory off` | Persist the project enable switch. |
 | `/memory auto-extract on\|off` / `/memory auto-dream on\|off` | Persist the corresponding automatic-work switch. |
+| `/memory recall on\|off` | Enable or disable relevant-memory injection on new prompts. |
+| `/memory shared-memory on\|off` | Enable or disable team-memory access; preserve existing files. |
+| `/memory cite-memories on\|off` | Enable or disable memory citation instructions on the next prompt. |
 | `/memory import-legacy` | Explicitly copy legacy personal memories, preserving conflicts and source files. |
-| `/pause-memory` | Toggle branch-local pause. Memory reads/writes, extraction, promotion, and Dream are denied while paused. |
+| `/pause-memory [on\|off]` | Toggle branch-local pause, or set it explicitly (`on` pauses, `off` resumes). Memory reads/writes, extraction, promotion, and Dream are denied while paused. |
 | `/memory-extract` | Request extraction now, bypassing automatic frequency gates but respecting pause/disable. |
 | `/remember <file.md>` | Promote a personal memory to team memory. Refuse an existing team destination; merge or rename it first. |
 | `/dream` | Run restricted consolidation using recent Pi session context and optional read-only project evidence. |
+
+The panel uses Pi's native settings list. Move with Up/Down and change a switch with Enter/Space; switching preserves the panel and selection. Changes save immediately, and a failed save restores the displayed value. Esc closes the panel after any pending save finishes. Running extraction, Dream, or opening a folder closes the panel to perform that action. The master switch and branch pause override feature preferences without erasing them. Commands offer argument completion; unrecognized settings are rejected. Reapplying the current switch or pause value does not cancel ongoing memory work.
 
 A memory contains a name, description, `metadata.type` (`user`, `feedback`, `project`, `reference`), optional pin, provenance, and a Markdown body. The main prompt carries the four memory-type descriptions, scope guidance, quality criteria, and the negative list of facts that should not be saved.
 
 ## Behavior and guarantees
 
-The system prompt snapshots the index and pinned memories at session start to preserve its cache prefix. Recall supplies relevant content on later user turns. Changed or deleted memories already supplied through the snapshot or recall produce updates, including on short prompts. Memory jobs run outside the foreground transcript; legacy injected Dream prompts remain excluded from ordinary recall.
+The system prompt snapshots the index and pinned memories at session start to preserve its cache prefix during ordinary memory edits. Explicit changes to shared-memory scope or citation settings rebuild that snapshot for the next prompt. Recall supplies relevant content on later user turns; disabling recall leaves the session index and pinned memories available. Changed or deleted memories already supplied through the snapshot or recall produce updates, including on short prompts. Memory jobs run outside the foreground transcript; legacy injected Dream prompts remain excluded from ordinary recall.
 
 The keyword selector uses stemming, full-width character folding, CJK fragments, and weak body matches. Recall revisions and byte usage are stored with injected messages and restored from the active visible context. Branch changes and compaction therefore restore eligibility when an attachment is no longer visible. Limits are defined in [`LIMITS`](src/config.ts): index loading is capped at 200 lines / 25,000 characters; memory recall at 200 lines / 4,096 bytes; the context recall budget is 61,440 bytes; at most four pinned memories are injected. Up to five recalls or freshness updates are sent per turn. Budget exhaustion still permits invalidation notices without file bodies. Pins beyond the initial four remain eligible for recall. `memory_save` additionally enforces body, index, and pinned limits on writes.
 
@@ -78,7 +83,7 @@ Read from `~/.pi/agent/memory/config.json`, then `<project>/.pi/memory.json`. `P
 }
 ```
 
-The defaults live in [`config.ts`](src/config.ts). Panel and command changes to `enabled`, `autoExtract`, and `autoDream` are written to the project's `.pi/memory.json` and restored on session start. Unknown configuration fields are preserved; invalid existing files are not overwritten. Other running Pi instances load saved changes on their next session start. Pause remains local to the selected session branch. `citeMemories` adds the reference's `<cc-memory>` citation instruction. `PI_MEMORY_DEBUG=1` enables local debug messages.
+The defaults and switch metadata live in [`config.ts`](src/config.ts). Panel and command changes to all six boolean switches are written to the project's `.pi/memory.json` and restored on session start. Unknown configuration fields are preserved; invalid existing files are not overwritten. Other running Pi instances load saved changes on their next session start. Pause remains local to the selected session branch. `citeMemories` adds the reference's `<cc-memory>` citation instruction. `PI_MEMORY_DEBUG=1` enables local debug messages.
 
 ## Reference parity
 

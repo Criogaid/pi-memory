@@ -23,7 +23,7 @@ Use **copied** for prompt text/constants, **adapted** for equivalent intent thro
 | Recall freshness/state | `pretty/m0354.js:104794`, `150849` | Message revisions/budget restore from visible context; changed/deleted snapshot and recalled content refresh | Adapted |
 | Seeded unchanged reads | `pretty/m0354.js:117872` | No shared read-state cache with pi's read tool | Omitted |
 | Pause | `pretty/m0169.js:9669`; `pretty/m0354.js:92635` | Selected ancestry restores pause; resolved tool paths and structured commands respect it | Adapted |
-| Memory panel | `pretty/m1646.js:1042` | Persisted project enable/extract/Auto-dream switches, branch pause, manual jobs, open folders, actual last-success time | Adapted |
+| Memory panel | `pretty/m1646.js:1042` | Pi SettingsList keeps toggles and selection in place; all six boolean settings persist, branch pause stays local, failed saves roll back, commands complete arguments, and manual actions exit the panel | Adapted |
 | Dream prompt and evidence | `pretty/m0354.js:106900` `iEt` and team/AGENTS reconciliation | Four-stage guidance, reconstructed Pi session excerpts, confined project reads through Pi's read tool, common read/apply protocol | Adapted; bounded sample and no shell/general fork |
 | Dream execution | `pretty/m0354.js:107051`, `87117` | Manual/opt-in automatic jobs, time/session thresholds, retry throttle, cross-process lock, versioned completion state independent of memory mtime, cancellation including preflight | Adapted; Pi awaits settled work |
 | `/remember` | Referenced in Dream guidance; no matching command implementation located in the bundled registration examined | Plugin promotion with conflict/pause checks | Plugin contract |

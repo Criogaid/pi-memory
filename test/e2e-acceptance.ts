@@ -130,7 +130,7 @@ check("[5] recall deduped on repeat", r5b?.message === undefined);
 
 // 6) pause blocks writes into memory dirs only
 const pauseCmd = commands.get("pause-memory")!;
-await pauseCmd.handler({}, mkCtx());
+await pauseCmd.handler("", mkCtx());
 const memFileAbs = path.join(memRoot, slugDir, savedFiles[0]);
 const r6: any = await handlers.get("tool_call")!({ toolName: "write", input: { path: memFileAbs, content: "x" } }, mkCtx());
 check("[6] write to memory blocked when paused", r6?.block === true, r6?.reason ?? "");
@@ -138,15 +138,15 @@ const r6b: any = await handlers.get("tool_call")!({ toolName: "write", input: { 
 check("[6] normal write unaffected", r6b === undefined);
 const r6c: any = await handlers.get("tool_call")!({ toolName: "memory_save", input: { name: "x", type: "user", description: "d", body: "b" } }, mkCtx());
 check("[6] memory_save blocked when paused", r6c?.block === true);
-await pauseCmd.handler({}, mkCtx()); // resume
+await pauseCmd.handler("", mkCtx()); // resume
 
 // 6p) pause gates both reads and writes.
-await pauseCmd.handler({}, mkCtx()); // pause again
+await pauseCmd.handler("", mkCtx()); // pause again
 const r6p: any = await handlers.get("tool_call")!({ toolName: "read", input: { path: memFileAbs } }, mkCtx());
 check("[6p] read blocked while paused", r6p?.block === true);
 const r6q: any = await handlers.get("tool_call")!({ toolName: "write", input: { path: memFileAbs, content: "x" } }, mkCtx());
 check("[6p] write blocked while paused", r6q?.block === true);
-await pauseCmd.handler({}, mkCtx()); // resume
+await pauseCmd.handler("", mkCtx()); // resume
 
 // 6d) `#` memory shortcut transforms input (Claude Code u$t port)
 const r6d: any = await handlers.get("input")!({ text: "# always deploy via the ops dashboard", source: "interactive", images: [] }, mkCtx());
@@ -176,7 +176,7 @@ const extractCtx = mkCtx({
 		content: [{ type: "text", text: `{"ops":[{"op":"upsert","file":"style-tabs.md","type":"feedback","description":"prefer tabs","body":"Use tabs. **Why:** user corrected me."}]}` }],
 	}),
 });
-await commands.get("memory-extract")!.handler({}, extractCtx);
+await commands.get("memory-extract")!.handler("", extractCtx);
 const files = fs.readdirSync(path.join(memRoot, slugDir));
 check("[7] extraction wrote file", files.includes("style-tabs.md"), files.join(","));
 check("[7] index gained pointer", fs.readFileSync(path.join(memRoot, slugDir, "MEMORY.md"), "utf-8").includes("style-tabs.md"));
@@ -219,13 +219,13 @@ const r10: any = await handlers.get("before_agent_start")!({ systemPrompt: "BASE
 check("[10] CJK query recall", String(r10?.message?.content ?? "").includes("deploy-policy.md"));
 
 // 11) paused `#` shortcut is handled (not passed through to the model)
-await pauseCmd.handler({}, mkCtx());
+await pauseCmd.handler("", mkCtx());
 const r11: any = await handlers.get("input")!({ text: "# paused shortcut attempt", source: "interactive", images: [] }, mkCtx());
 check("[11] paused # shortcut handled with notice", r11?.action === "handled");
 // 11b) paused read of a memory file is blocked (Claude Code denies reads too)
 const r11b: any = await handlers.get("tool_call")!({ toolName: "read", input: { path: path.join(memRoot, slugDir, "style-tabs.md") } }, mkCtx());
 check("[11b] read of memory blocked when paused", r11b?.block === true);
-await pauseCmd.handler({}, mkCtx()); // resume
+await pauseCmd.handler("", mkCtx()); // resume
 
 // 12) /remember argument completion lists personal memories (pi API reuse)
 const completions = commands.get("remember")!.getArgumentCompletions?.("") ?? null;
@@ -262,12 +262,12 @@ check(
 		const r: any = await handlers.get("tool_call")!({ toolName: "write", input: { path: memFileAbs, content: "x" } }, mkCtx());
 		return r?.block === true;
 	};
-	await pauseCmd.handler({}, mkCtx()); // on
-	await pauseCmd.handler({}, mkCtx()); // off
-	await pauseCmd.handler({}, mkCtx()); // on
+	await pauseCmd.handler("", mkCtx()); // on
+	await pauseCmd.handler("", mkCtx()); // off
+	await pauseCmd.handler("", mkCtx()); // on
 	await handlers.get("session_start")!({}, mkCtx());
 	check("[16] pause state restored from last entry (on)", await probePaused());
-	await pauseCmd.handler({}, mkCtx()); // off again
+	await pauseCmd.handler("", mkCtx()); // off again
 	await handlers.get("session_start")!({}, mkCtx());
 	check("[16] pause state restored from last entry (off)", !(await probePaused()));
 }

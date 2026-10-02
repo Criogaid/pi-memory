@@ -5,7 +5,9 @@ import * as path from "node:path";
 import { test } from "node:test";
 import { fork } from "node:child_process";
 import { once } from "node:events";
-import { createEditTool, createWriteTool, SessionManager, type ExtensionAPI, type ExtensionContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { createEditTool, createWriteTool, initTheme, SessionManager, withFileMutationQueue, type ExtensionAPI, type ExtensionContext, type ToolDefinition, type RegisteredCommand } from "@earendil-works/pi-coding-agent";
+import type { Component, TUI } from "@earendil-works/pi-tui";
+import { setTimeout as delay } from "node:timers/promises";
 import type { BeforeAgentStartEventResult } from "@earendil-works/pi-coding-agent";
 import type { Context } from "@earendil-works/pi-ai";
 import factory from "../src/index.ts";
@@ -17,7 +19,7 @@ import { listMemories, truncateMemory } from "../src/store.ts";
 import { MemoryJobs, type MemoryJobRequest } from "../src/workflow.ts";
 
 type Handler = (event: unknown, ctx: ExtensionContext) => unknown | Promise<unknown>;
-interface Command { handler: (args: string, ctx: ExtensionContext) => unknown | Promise<unknown>; }
+interface Command { handler: (args: string, ctx: ExtensionContext) => unknown | Promise<unknown>; getArgumentCompletions?: RegisteredCommand["getArgumentCompletions"]; }
 
 async function withSession(run: (session: Awaited<ReturnType<typeof createSession>>) => Promise<void>) {
 	const session = await createSession();
@@ -45,14 +47,21 @@ async function createSession() {
 	let activeTools = ["read", "write", "edit", "memory_save"];
 	let waitForIdle = async () => {};
 	// Only host boundary objects are mocked; history and persistence use the real implementations.
+	let panel: (Component & { dispose?(): void }) | undefined;
+	const custom = async (build: (tui: Pick<TUI, "requestRender">, theme: unknown, keybindings: unknown, done: (value: unknown) => void) => Component | Promise<Component>) => {
+		initTheme("dark");
+		const closed = Promise.withResolvers<unknown>();
+		panel = await build({ requestRender: () => {} }, undefined, undefined, closed.resolve);
+		try { return await closed.promise; } finally { panel?.dispose?.(); panel = undefined; }
+	};
 	const ctx = {
-		cwd, hasUI: true, sessionManager: manager, model: { id: "test-model" },
+		cwd, hasUI: true, mode: "tui", sessionManager: manager, model: { id: "test-model" },
 		modelRegistry: { complete: async (_model: unknown, request: Context) => {
 			modelCalls++;
 			return { role: "assistant", stopReason: "stop", content: [{ type: "text", text: await modelReply(request) }], timestamp: Date.now() };
 		} },
 		getSystemPrompt: () => parentRule,
-		ui: { notify: (text: string) => notifications.push(text), setStatus: () => {}, select: async () => undefined },
+		ui: { notify: (text: string) => notifications.push(text), setStatus: () => {}, select: async () => undefined, custom },
 		waitForIdle: () => waitForIdle(),
 	} as unknown as ExtensionContext;
 	const api = {
@@ -85,6 +94,8 @@ async function createSession() {
 	await emit("session_start");
 	return {
 		root, cwd, ctx, config, paths: resolvePaths(cwd, config), manager, notifications, emit, command, save, turn,
+		panel: () => panel,
+		complete: (prefix: string) => commands.get("memory")?.getArgumentCompletions?.(prefix),
 		modelCalls: () => modelCalls,
 		parentRule,
 		activeTools: () => activeTools,
@@ -136,6 +147,15 @@ async function changeMemoryWithBuiltin(s: Awaited<ReturnType<typeof createSessio
 		await s.emit("tool_result", { toolName, input, isError: false });
 	}
 	return parseMemory(fs.readFileSync(file, "utf8"));
+}
+
+async function waitUntil(condition: () => boolean) {
+	const timeoutMs = 5000, pollMs = 10;
+	const deadline = Date.now() + timeoutMs;
+	while (!condition()) {
+		assert.ok(Date.now() < deadline, "Observable state did not settle within the test deadline");
+		await delay(pollMs);
+	}
 }
 
 test("same-basename projects have isolated personal memory", async () => withSession(async (s) => {
@@ -872,3 +892,139 @@ for (const [encoding, unit] of [["ASCII", crypto.randomUUID()], ["multibyte", "è
 		}
 	}));
 }
+
+test("memory panel keeps selection and stays open while switches are saved", async () => withSession(async (s) => {
+	let closed = false;
+	const opening = s.command("memory").then(() => { closed = true; });
+	await delay(0);
+	const panel = s.panel();
+	assert.ok(panel);
+	panel.render(80);
+	panel.handleInput?.("\r");
+	await waitUntil(() => !s.activeTools().includes("memory_save"));
+	assert.equal(closed, false);
+	assert.equal(s.panel(), panel);
+	panel.handleInput?.("\r");
+	await waitUntil(() => s.activeTools().includes("memory_save"));
+	assert.equal(closed, false);
+	panel.handleInput?.("\u001b[B");
+	panel.handleInput?.(" ");
+	await waitUntil(() => s.manager.getBranch().some((entry) => entry.type === "custom" && entry.customType === "pi-memory:state" && typeof entry.data === "object" && entry.data !== null && "paused" in entry.data && entry.data.paused === true));
+	assert.equal(s.panel(), panel);
+	panel.handleInput?.("\u001b");
+	await opening;
+	assert.equal(closed, true);
+	assert.equal(s.panel(), undefined);
+}));
+
+test("memory panel rolls a failed switch save back before the next toggle", async () => withSession(async (s) => {
+	const file = path.join(s.cwd, ".pi", "memory.json");
+	const original = fs.readFileSync(file, "utf8"), malformed = crypto.randomUUID();
+	fs.writeFileSync(file, malformed);
+	const opening = s.command("memory");
+	await delay(0);
+	const panel = s.panel();
+	assert.ok(panel);
+	const notices = s.notifications.length;
+	panel.handleInput?.("\r");
+	await waitUntil(() => s.notifications.length > notices);
+	assert.equal(fs.readFileSync(file, "utf8"), malformed);
+	assert.ok(s.activeTools().includes("memory_save"));
+	assert.equal(s.panel(), panel);
+	fs.writeFileSync(file, original);
+	panel.handleInput?.("\r");
+	await waitUntil(() => !s.activeTools().includes("memory_save"));
+	assert.equal(loadConfig(s.cwd).enabled, false);
+	panel.handleInput?.("\u001b");
+	await opening;
+}));
+
+test("feature switch commands update current behavior and survive reload", async () => withSession(async (s) => {
+	await s.save("lookup", { body: crypto.randomUUID() });
+	await s.command("memory", "recall off");
+	assert.equal(loadConfig(s.cwd).recall, false);
+	assert.equal((await s.turn("durable preference"))?.message, undefined);
+	await s.command("memory", "recall on");
+	assert.ok((await s.turn("durable preference"))?.message);
+	await s.command("memory", "shared-memory off");
+	await s.save("blocked-team", { team: true });
+	assert.ok(s.paths.teamDir);
+	assert.equal(fs.existsSync(path.join(s.paths.teamDir, "blocked-team.md")), false);
+	await s.command("memory", "shared-memory on");
+	await s.save("allowed-team", { team: true });
+	assert.ok(fs.existsSync(path.join(s.paths.teamDir, "allowed-team.md")));
+	await s.command("memory", "cite-memories on");
+	await s.emit("session_start");
+	assert.equal(loadConfig(s.cwd).citeMemories, true);
+	await s.command("memory", "cite-memories off");
+	assert.equal(loadConfig(s.cwd).citeMemories, false);
+}));
+
+test("memory panel waits for a queued save before honoring Escape", async () => withSession(async (s) => {
+	const started = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+	const held = withFileMutationQueue(path.join(s.cwd, ".pi", "memory.json"), async () => { started.resolve(); await release.promise; });
+	await started.promise;
+	let closed = false;
+	const opening = s.command("memory").then(() => { closed = true; });
+	try {
+		await delay(0);
+		const panel = s.panel();
+		assert.ok(panel);
+		panel.handleInput?.("\r");
+		panel.handleInput?.("\u001b");
+		await delay(0);
+		assert.equal(closed, false);
+		assert.ok(s.activeTools().includes("memory_save"));
+	} finally { release.resolve(); await held; }
+	await opening;
+	assert.equal(loadConfig(s.cwd).enabled, false);
+	assert.equal(s.activeTools().includes("memory_save"), false);
+	assert.equal(s.panel(), undefined);
+}));
+
+test("memory command completions lead to working persistent switches", async () => withSession(async (s) => {
+	const before = loadConfig(s.cwd);
+	const completions = await s.complete("recall ");
+	assert.ok(completions?.length);
+	for (const item of completions) {
+		await s.command("memory", item.value);
+		assert.equal(loadConfig(s.cwd).recall, item.value.endsWith(" on"));
+	}
+	assert.equal(loadConfig(s.cwd).autoExtract, before.autoExtract);
+	await s.command("pause-memory", "on");
+	await s.command("pause-memory", "on");
+	const input = { path: path.join(s.paths.personalDir, "paused.md"), content: crypto.randomUUID() };
+	assert.ok(await s.emit("tool_call", { toolName: "write", input }));
+	await s.command("pause-memory", "off");
+	assert.equal(await s.emit("tool_call", { toolName: "write", input }), undefined);
+}));
+
+test("memory reports state in RPC and rejects unknown settings without opening a panel", async () => withSession(async (s) => {
+	s.ctx.mode = "rpc";
+	const notices = s.notifications.length;
+	await s.command("memory");
+	assert.ok(s.notifications.length > notices);
+	assert.equal(s.panel(), undefined);
+	const file = path.join(s.cwd, ".pi", "memory.json"), original = fs.readFileSync(file, "utf8");
+	s.ctx.mode = "tui";
+	await s.command("memory", crypto.randomUUID());
+	assert.equal(s.panel(), undefined);
+	assert.equal(fs.readFileSync(file, "utf8"), original);
+}));
+
+test("reapplying current memory and pause settings does not cancel extraction", async () => withSession(async (s) => {
+	const started = Promise.withResolvers<void>(), response = Promise.withResolvers<string>();
+	const payload = crypto.randomUUID();
+	s.setModelReply(async () => { started.resolve(); return response.promise; });
+	s.addUser("Remember this durable project workflow preference");
+	const settled = s.emit("agent_settled");
+	await started.promise;
+	try {
+		await s.command("memory", "on");
+		await s.command("pause-memory", "off");
+	} finally {
+		response.resolve(JSON.stringify({ ops: [{ op: "upsert", file: "uninterrupted.md", type: "project", description: payload, body: payload }] }));
+		await settled;
+	}
+	assert.equal(parseMemory(fs.readFileSync(path.join(s.paths.personalDir, "uninterrupted.md"), "utf8")).body.trim(), payload);
+}));

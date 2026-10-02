@@ -7,7 +7,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { lock } from "proper-lockfile";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
-import { projectConfigFile, type MemoryConfig } from "./config.js";
+import { projectConfigFile, type MemorySwitches } from "./config.js";
 import { writeFileSafe } from "./store.js";
 
 export type LockedResult<T> = { readonly kind: "busy" } | { readonly kind: "done"; readonly value: T };
@@ -36,8 +36,6 @@ export async function withStateLock<T>(file: string, signal: AbortSignal | undef
 export function isFileError(error: unknown, code: string): boolean {
 	return error instanceof Error && "code" in error && error.code === code;
 }
-
-export type MemorySwitches = Pick<MemoryConfig, "enabled" | "autoExtract" | "autoDream">;
 
 /** Preserve unknown configuration fields; malformed existing files are never overwritten. */
 export async function saveMemorySwitches(cwd: string, changes: Partial<MemorySwitches>): Promise<void> {

@@ -56,6 +56,19 @@ export interface MemoryConfig {
 	citeMemories: boolean;
 }
 
+export type MemorySwitches = { [Key in keyof MemoryConfig as MemoryConfig[Key] extends boolean ? Key : never]: MemoryConfig[Key] };
+export type MemorySwitchKey = keyof MemorySwitches;
+
+/** Shared settings metadata for command completion, parsing, and the native settings list. */
+export const MEMORY_SWITCHES = [
+	{ key: "enabled", command: "", label: "Memory", description: "Enable memory for this project. Turning it off keeps the feature settings below." },
+	{ key: "autoExtract", command: "auto-extract", label: "Automatic extraction", description: "Save durable facts after a conversation turn. Requires Memory on and this branch unpaused." },
+	{ key: "autoDream", command: "auto-dream", label: "Automatic Dream", description: "Consolidate memories when enough new sessions and time have accumulated. Requires Memory on and this branch unpaused." },
+	{ key: "recall", command: "recall", label: "Recall", description: "Add relevant memory bodies to new prompts. The session index and pinned memories remain available." },
+	{ key: "sharedMemory", command: "shared-memory", label: "Shared memory", description: "Read and write team memories in this project's .pi/memory directory. Turning it off preserves existing files." },
+	{ key: "citeMemories", command: "cite-memories", label: "Memory citations", description: "Ask the model to mark memory-backed statements. Takes effect on the next prompt." },
+] as const satisfies readonly { key: MemorySwitchKey; command: string; label: string; description: string }[];
+
 // Keep README.md Configuration defaults aligned with this object.
 const DEFAULTS: MemoryConfig = {
 	enabled: true,
