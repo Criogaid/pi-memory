@@ -67,7 +67,9 @@ export class MemoryJobs {
 async function execute(ctx: ExtensionContext, request: MemoryJobRequest, signal: AbortSignal): Promise<MemoryJobResult> {
 	if (!ctx.model) throw new Error("No active model for the memory job");
 	const observations = new Map<string, string | null>();
-	const modelSessionId = uuidv7();
+	// Repeated jobs share the inherited system prefix, so a stable per-session, per-kind key lets
+	// providers reuse it; it stays distinct from the foreground key so job traffic never shares its routing.
+	const cacheSessionId = `pi-memory-${request.kind}:${request.sessionId}`;
 	const messages: Message[] = [{ role: "user", content: request.prompt, timestamp: Date.now() }];
 	const systemPrompt = request.systemPrompt +
 		`\n\nThis is a restricted memory job. Return only JSON, either {"read":["memory.md"]} or {"ops":[...]}. ` +
@@ -79,7 +81,7 @@ async function execute(ctx: ExtensionContext, request: MemoryJobRequest, signal:
 		if (Buffer.byteLength(systemPrompt + JSON.stringify(messages), "utf8") > MAX_CONTEXT_BYTES)
 			throw new Error("Memory job context exceeds its bound; no further operations were applied");
 		const response = await awaitWithAbort(ctx.modelRegistry.complete(ctx.model, { systemPrompt, messages }, {
-			signal, maxTokens: MAX_OUTPUT_TOKENS, sessionId: modelSessionId, cacheRetention: "none",
+			signal, maxTokens: MAX_OUTPUT_TOKENS, sessionId: cacheSessionId,
 		}), signal);
 		signal.throwIfAborted();
 		if (response.stopReason === "error" || response.stopReason === "aborted")
