@@ -25,14 +25,14 @@ Enterprise services, paid semantic retrieval, replacing pi's instruction loader,
 | Correctness and persistence | Complete | Nine regression cases failed before changes; all 14 current regressions plus original E2E, strict/no-unused TypeScript checks and diff checks pass |
 | Recall state and freshness | Complete | 22 behavior regressions and cleaned lifecycle acceptance pass; real session branches/compaction drive recall restoration; freshness preserves the system prefix |
 | npm toolchain | Complete | Locked pi 0.85.1 development dependencies; Node runner with pi's Jiti dependency; npm check and both test suites pass |
-| Extraction workflow | Pending | Use modelRegistry.complete with bounded validated operations and full existing content |
+| Extraction workflow | Complete | 30 behavior regressions plus lifecycle acceptance; complete-body reads, parent context, stale-write rejection, cancellation, reload cursors, and sequential operations verified through public commands/events |
 | Dream lifecycle and settings | Pending | Share the model/mutation boundary with extraction |
 | Final audit and documentation | Pending | Audit every acceptance item against tests and final code |
 
 ## Ownership and decisions
 
 - `config.ts` owns project identity and resolved configuration; `store.ts` owns memory/index persistence and path containment.
-- `recall.ts` owns relevance and surfaced-memory state. Session wiring stays in `index.ts`; move background workflow ownership out when implementing its lifecycle.
+- `recall.ts` owns relevance and surfaced-memory state. Session wiring stays in `index.ts`; `workflow.ts` owns bounded model execution and cancellation, reusing pi's model registry and file mutation queue.
 - Reuse the current validated operation protocol for extraction and Dream instead of starting an unrestricted secondary pi process. This keeps allowed effects explicit and makes cancellation/conflict behavior testable. Add bounded reads of existing memory where needed; no shell execution in memory jobs.
 - Preserve existing legacy basename directories. New canonical-path identities prevent cross-project mixing; any legacy import must be deliberate and conflict-safe.
 - File and index replacement can be atomic individually on the local filesystem. Multi-file persistence needs preflight, rollback on ordinary failures, and an explicit crash-recovery story; do not claim cross-file atomicity.
@@ -59,7 +59,7 @@ Portable npm scripts and dev dependency declarations replace the machine-specifi
 
 ## Next action
 
-Replace extraction and Dream with the bounded shared workflow, using pi public APIs for model calls, session context, queues, and lifecycle. Do not reintroduce prompt or diagnostic wording tests. Use npm for all repository commands.
+Implement manual/automatic Dream and persisted settings on the bounded shared workflow. Reuse pi's SessionManager to load transcripts and public model/context/queue/lifecycle APIs. Do not reintroduce prompt or diagnostic wording tests. Use npm for all repository commands.
 
 ## Recall milestone evidence and user constraints
 
@@ -68,3 +68,11 @@ Recall stores versioned revisions and byte usage on the actual injected custom m
 The user explicitly prohibited literal-pinning and wording tests. Removed prompt prose, UI labels, YAML ordering, reason strings, and diagnostic phrasing assertions. Recall data-delivery tests use generated payloads. Keep behavior assertions only.
 
 The user requires npm exclusively. Node's built-in test runner uses Jiti 2.7.0, also used by pi's extension loader. The lockfile pins a standalone development installation to pi 0.85.1. npm run check, npm test (22 regressions plus lifecycle acceptance), and the no-unused TypeScript check pass. The user also requires reuse of pi infrastructure; inspect public host APIs before implementing missing lifecycle behavior.
+
+## Extraction milestone evidence
+
+The workflow uses pi's `modelRegistry.complete`, `getSystemPrompt`, `buildContextEntries`, `serializeConversation`, `truncateTail`, and `withFileMutationQueue`. It owns only the restricted JSON read/apply protocol and its bounds; pi has no public fork entry point that enforces this protocol. Complete body reads populate observations checked inside the mutation queue. Updates preserve original provenance and omitted pin settings. Cursor and direct-write metadata follow active ancestry across reload.
+
+Pause, disable, foreground turns, compaction, branch/fork/switch, and shutdown cancel jobs. A provider that ignores cancellation can finish later, but its response is discarded. Queued mutations check the signal before effects. A cancelled/failed batch may retain earlier committed operations; only fully completed extraction advances its cursor. Model session identifiers are isolated from the foreground conversation.
+
+Verification: npm run check, npm test (30 regressions plus lifecycle acceptance), no-unused TypeScript checks, and git diff --check pass. Tests validate inherited context/data delivery, read-before-update enforcement, concurrent file preservation, cancellation, cursor restoration, and multi-operation persistence. No prompt wording assertions were added.

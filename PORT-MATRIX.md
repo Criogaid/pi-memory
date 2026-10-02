@@ -15,8 +15,8 @@ Use **copied** for prompt text/constants, **adapted** for equivalent intent thro
 | Direct-write extraction gate | `pretty/m0354.js:106561`, `106764` | Consume the current window and clear direct-write state | Adapted |
 | Missing extraction cursor | `pretty/m0354.js:106546`, `106602` | Fall back to visible messages after compaction/branch cursor loss | Adapted |
 | Extraction frequency | `pretty/m0354.js:106787` | Counts messages instead of qualifying events | Partial |
-| Extraction context and tools | `pretty/m0354.js:106681`, `112561` | Single JSON call with compact rules and memory descriptions; no old-body reads | Partial |
-| Extraction cancellation/coalescing | `pretty/m0354.js:106839` | Local coalescing exists; full job lifecycle/draining is not restored | Partial |
+| Extraction context and tools | `pretty/m0354.js:106681`, `112561` | Bounded JSON read/apply workflow with full parent/memory rules, complete old bodies, and optimistic revision checks | Adapted |
+| Extraction cancellation/coalescing | `pretty/m0354.js:106839` | One active job, trailing extraction coalescing, provider deadline, and cancellation on lifecycle changes; cancelled queued writes check their signal before effects | Adapted |
 | Recall ranking | `pretty/m0354.js:149547` `LBt`, `149631` `Ssr` | Keyword/stem/CJK scoring | Intentional substitute |
 | Recall prefetch | `pretty/m0354.js:150887` `z4n` | Synchronous recall during `before_agent_start` | Omitted |
 | Internal Dream recall exclusion | `pretty/m0354.js:150885` `Vsr` | Dream prompt detection is wired into recall | Adapted for the current injected task |

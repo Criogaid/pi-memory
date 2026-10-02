@@ -46,7 +46,9 @@ Structured saving, extraction, deletion, and promotion share one mutation owner.
 
 Individual file replacement uses a temporary file followed by rename. Ordinary multi-file failures restore previously modified files to their original bytes; rollback failure is reported explicitly. This is not a cross-file crash transaction: a process/OS crash between renames can leave a memory and its index out of sync. The current queues serialize operations within one pi process, not independent pi processes. Keep a backup or version history when editing shared memories.
 
-Automatic extraction skips a turn that already wrote memory directly, then resumes for later turns. A missing cursor after compaction falls back to the visible history. The current threshold counts new messages; the reference counts qualifying events. Extraction is one structured model call with validated operations, rather than the reference's tool-using subagent.
+Automatic extraction skips a turn that already wrote memory directly, then resumes for later turns. The consumed cursor survives reload; a missing cursor after compaction falls back to visible history. The current threshold counts new messages; the reference counts qualifying events.
+
+Extraction uses pi's model registry, effective parent prompt, conversation serialization, truncation utility, and file queue. Its restricted JSON workflow can request complete old memory bodies before proposing changes. Unread, oversized, or concurrently changed memories cannot be overwritten. Updates preserve origin provenance and omitted pin settings. The workflow bounds model turns, response size, context size, and elapsed time; pause, disable, session transitions, compaction, and a new foreground turn cancel pending work. Each operation is independently committed, so a partial result retains successful earlier operations and leaves the extraction cursor unchanged.
 
 ## Configuration
 
@@ -69,7 +71,7 @@ Read from `~/.pi/agent/memory/config.json`, then `<project>/.pi/memory.json`. `P
 
 [`PORT-MATRIX.md`](PORT-MATRIX.md) distinguishes copied prompt material, adapted behavior, and missing mechanisms. A matching message or constant does not establish lifecycle parity.
 
-Current intentional differences include keyword retrieval instead of a paid model selector, local files instead of enterprise stores/synchronization, pi's `AGENTS.md` loader instead of Claude Code's instruction hierarchy, and pi session JSONL instead of reference activity logs. Complete extraction context and a bounded Dream lifecycle are being implemented under the acceptance plan in [`IMPLEMENTATION.md`](IMPLEMENTATION.md).
+Current intentional differences include keyword retrieval instead of a paid model selector, local files instead of enterprise stores/synchronization, pi's `AGENTS.md` loader instead of Claude Code's instruction hierarchy, and pi session JSONL instead of reference activity logs. A bounded Dream lifecycle is being implemented under the acceptance plan in [`IMPLEMENTATION.md`](IMPLEMENTATION.md).
 
 ## Development
 

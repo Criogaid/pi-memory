@@ -1,27 +1,26 @@
 /**
- * Background memory extraction (extractMemories port) and the dream prompt.
- *
- * Claude Code forks a sandboxed subagent with a restricted tool set; pi
- * extensions have no subagent API, so this port runs a single structured model
- * call (ctx.modelRegistry.complete) and applies a JSON op protocol through
- * this extension's own validation — no model-driven disk writes at all, which
- * keeps the security boundary without the tool loop.
+ * Memory extraction policy, prompts, and the read/apply protocol.
+ * workflow.ts owns model execution; store.ts owns serialized persistence.
+ * Complete observed bodies are required before model updates, and each
+ * operation reports its outcome independently when a batch only partly succeeds.
  */
 
+import type { SessionEntry, SessionMessageEntry } from "@earendil-works/pi-coding-agent";
 import {
 	LIMITS,
 	MEMORY_INDEX,
 	MEMORY_TYPES,
 	type MemoryPaths,
-	type MemoryType,
 } from "./config.js";
 import {
 	listMemories,
 	mutateMemory,
 	isValidFileRef,
 	formatIndexLine,
+	memoryPath,
+	readFileOrNull,
 } from "./store.js";
-import { serializeMemory } from "./frontmatter.js";
+import { parseMemory, serializeMemory } from "./frontmatter.js";
 
 const DREAM_HEADER = "# Dream: Memory Consolidation";
 
@@ -37,7 +36,7 @@ export interface ExtractionGateResult {
 export interface EntryView {
 	role?: string;
 	text: string;
-	message: unknown;
+	message: SessionMessageEntry["message"];
 }
 
 function entryText(content: unknown): string {
@@ -46,7 +45,7 @@ function entryText(content: unknown): string {
 		return content
 			.map((block) => {
 				if (typeof block === "string") return block;
-				if (block && typeof block === "object" && "text" in block) return String((block as { text: unknown }).text);
+				if (block && typeof block === "object" && "text" in block) return String(block.text);
 				return "";
 			})
 			.filter(Boolean)
@@ -62,26 +61,25 @@ function entryText(content: unknown): string {
  * navigation, unlike a message count.
  */
 export function collectEntriesSince(
-	branchEntries: unknown[],
+	branchEntries: readonly SessionEntry[],
 	sinceEntryId: string | null,
 ): { views: EntryView[]; lastEntryId: string | null } {
 	const views: EntryView[] = [];
 	let lastEntryId: string | null = sinceEntryId;
 	// Compaction or branch navigation may remove the cursor from the visible history.
-	let collecting = sinceEntryId === null || !branchEntries.some((entry) =>
-		typeof entry === "object" && entry !== null && "id" in entry && entry.id === sinceEntryId);
-	for (const entry of branchEntries as Array<Record<string, unknown>>) {
-		const id = typeof entry?.id === "string" ? entry.id : null;
+	let collecting = sinceEntryId === null || !branchEntries.some((entry) => entry.id === sinceEntryId);
+	for (const entry of branchEntries) {
+		const id = entry.id;
 		if (!collecting) {
 			if (id && id === sinceEntryId) collecting = true;
 			continue;
 		}
-		const message = entry?.message as Record<string, unknown> | undefined;
-		if (!message) continue;
+		if (entry.type !== "message") continue;
+		const message = entry.message;
 		if (id) lastEntryId = id;
 		views.push({
-			role: typeof message.role === "string" ? message.role : undefined,
-			text: entryText(message.content),
+			role: message.role,
+			text: "content" in message ? entryText(message.content) : "",
 			message,
 		});
 	}
@@ -99,7 +97,7 @@ export function collectEntriesSince(
  * the original counts gate-passing events (equivalent at the default of 1).
  */
 export function checkExtractionGates(
-	views: EntryView[],
+	views: readonly Pick<EntryView, "role" | "text">[],
 	minMessages: number,
 	directWriteSeen: boolean,
 ): ExtractionGateResult {
@@ -132,20 +130,6 @@ export function containsSecret(text: string): boolean {
 	return SECRET_PATTERNS.some((re) => re.test(text));
 }
 
-export interface ExtractOpUpsert {
-	op: "upsert";
-	file: string;
-	type: MemoryType;
-	description: string;
-	body: string;
-	pinned?: boolean;
-	indexLine?: string;
-}
-export interface ExtractOpDelete {
-	op: "delete";
-	file: string;
-}
-export type ExtractOp = ExtractOpUpsert | ExtractOpDelete;
 
 
 /**
@@ -174,22 +158,47 @@ export interface ApplyResult {
 	written: string[];
 }
 
+export interface ApplyOptions {
+	readonly observations: ReadonlyMap<string, string | null>;
+	readonly signal: AbortSignal;
+}
+
 /** Apply the plugin's validated operation protocol through the shared mutation owner. */
-export async function applyExtractOps(paths: MemoryPaths, ops: unknown, sessionId: string): Promise<ApplyResult> {
+export async function applyExtractOps(paths: MemoryPaths, ops: unknown, sessionId: string, options?: ApplyOptions): Promise<ApplyResult> {
 	const result: ApplyResult = { applied: 0, skipped: [], written: [] };
 	if (!Array.isArray(ops)) {
 		result.skipped.push("response was not a JSON object with an ops array");
 		return result;
 	}
-	for (const raw of ops.slice(0, LIMITS.extractMaxOps)) {
-		const op = raw as Record<string, unknown>;
-		const file = typeof op?.file === "string" ? op.file : "";
+	if (ops.length > LIMITS.extractMaxOps) {
+		result.skipped.push(`ops must contain at most ${LIMITS.extractMaxOps} operations`);
+		return result;
+	}
+	const operations: readonly unknown[] = ops;
+	const expected = options ? new Map(options.observations) : undefined;
+	const mutate = async (change: Parameters<typeof mutateMemory>[1]): Promise<Awaited<ReturnType<typeof mutateMemory>>> => {
+		try { return await mutateMemory(paths, change, expected, options?.signal); }
+		catch (error) { return { ok: false, error: error instanceof Error ? error.message : String(error) }; }
+	};
+	const visited = new Set<string>();
+	for (const raw of operations) {
+		if (options?.signal.aborted) { result.skipped.push("cancelled before applying remaining operations"); break; }
+		if (typeof raw !== "object" || raw === null || !("file" in raw) || typeof raw.file !== "string" || !("op" in raw)) {
+			result.skipped.push("each operation requires op and file fields");
+			continue;
+		}
+		const op = raw;
+		const file = raw.file;
 		if (!isValidFileRef(file, paths.teamDir !== null)) {
 			result.skipped.push(`${file || "(unnamed)"}: file must be a lowercase .md name (kebab-case, underscores allowed; team/ prefix allowed)`);
 			continue;
 		}
+		if (visited.has(file)) { result.skipped.push(`${file}: duplicate operation`); continue; }
+		visited.add(file);
+		if (expected && !expected.has(file)) { result.skipped.push(`${file}: read the memory before changing it`); continue; }
 		if (op?.op === "delete") {
-			const deleted = await mutateMemory(paths, { kind: "delete", ref: file });
+			const deleted = await mutate({ kind: "delete", ref: file });
+			if (deleted.ok) expected?.set(file, null);
 			if (deleted.ok) { result.applied++; result.written.push(`deleted ${file}`); }
 			else result.skipped.push(`${file}: ${deleted.error}`);
 			continue;
@@ -198,10 +207,10 @@ export async function applyExtractOps(paths: MemoryPaths, ops: unknown, sessionI
 			result.skipped.push(`${file}: unknown op`);
 			continue;
 		}
-		const type = op.type as MemoryType;
-		const description = normalizeContent(typeof op.description === "string" ? op.description : "").trim();
-		const body = normalizeContent(typeof op.body === "string" ? op.body : "").trim();
-		if (!MEMORY_TYPES.includes(type)) {
+		const type = "type" in op ? MEMORY_TYPES.find((type) => type === op.type) : undefined;
+		const description = normalizeContent("description" in op && typeof op.description === "string" ? op.description : "").trim();
+		const body = normalizeContent("body" in op && typeof op.body === "string" ? op.body : "").trim();
+		if (!type) {
 			result.skipped.push(`${file}: type must be one of ${MEMORY_TYPES.join("|")}`);
 			continue;
 		}
@@ -221,7 +230,9 @@ export async function applyExtractOps(paths: MemoryPaths, ops: unknown, sessionI
 			result.skipped.push(`${file}: content contains potential secrets and cannot be written to memory`);
 			continue;
 		}
-		const pinned = op.pinned === true;
+		const prior = expected?.get(file) ?? readFileOrNull(memoryPath(paths, file));
+		const previous = prior === null ? undefined : parseMemory(prior).frontmatter;
+		const pinned = "pinned" in op && typeof op.pinned === "boolean" ? op.pinned : previous?.pinned === true;
 		const name = file.replace(/\.md$/, "");
 		const content = serializeMemory(
 			{
@@ -229,21 +240,22 @@ export async function applyExtractOps(paths: MemoryPaths, ops: unknown, sessionI
 				description,
 				type,
 				pinned,
-				originSessionId: sessionId,
+				originSessionId: previous?.originSessionId ?? sessionId,
 				modified: new Date().toISOString(),
 			},
 			body,
 		);
 		const indexLine =
-			typeof op.indexLine === "string" && op.indexLine.trim()
+			"indexLine" in op && typeof op.indexLine === "string" && op.indexLine.trim()
 				? flattenIndexLine(normalizeContent(op.indexLine))
 				: formatIndexLine(file, name, description);
-		const indexResult = await mutateMemory(paths, { kind: "upsert", ref: file, content, indexLine });
+		const indexResult = await mutate({ kind: "upsert", ref: file, content, indexLine });
 		if (!indexResult.ok) {
 			result.skipped.push(`${file}: ${indexResult.error}`);
 			continue;
 		}
 		result.applied++;
+		expected?.set(file, content);
 		result.written.push(file);
 	}
 	return result;
@@ -261,15 +273,15 @@ export function buildExtractionPrompt(paths: MemoryPaths, transcript: string, ne
 		`You MUST only use content from the last ~${newMessageCount} messages. Do not waste any turns attempting to investigate or verify that content further — no grepping source files, no reading code to confirm a pattern exists, no git commands.`,
 		existing,
 		"",
-		"Apply the memory types, what-not-to-save criteria, and frontmatter format from the rules below.", // eEt said “from the Memory section of your system prompt” — this single call carries none, so the criteria are inlined in Rules
+		"Apply the full memory rules from the system prompt. Read an existing memory before updating or deleting it.",
 		"",
-		"Output ONLY a JSON object, no prose, no code fences:",
+		'Output a JSON object: {"read":["existing-file.md"]} to read complete memory bodies, or the final operations below:',
 		'{"ops": [',
-		'  {"op": "upsert", "file": "kebab-case-name.md", "type": "user|feedback|project|reference", "description": "one-line summary used for future relevance decisions", "body": "the fact; for feedback/project follow with **Why:** and **How to apply:** lines; link related memories with [[their-name]]", "pinned": false, "indexLine": "- [Title](file.md) — one-line hook under 150 chars"},',
+		`  {"op": "upsert", "file": "kebab-case-name.md", "type": "user|feedback|project|reference", "description": "one-line summary", "body": "durable knowledge with rationale", "indexLine": "- [Title](file.md) — hook under ${LIMITS.indexLineMaxChars} chars"},`,
 		'  {"op": "delete", "file": "stale-memory.md"}',
 		"]}",
 		"",
-		"Rules: at most one fact per file; keep each body under 4096 bytes; only save what is applicable (changes future behavior), durable (multiple future sessions), and legible (readable without this session); if nothing is worth saving output {\"ops\": []}.",
+		`Return at most ${LIMITS.extractMaxOps} operations. Keep each body under ${LIMITS.fileMaxBytes} bytes. If nothing is worth saving, output {"ops": []}.`,
 		"If the user explicitly asks you to remember something, save it immediately as whichever type fits best. If they ask you to forget something, find and remove the relevant entry.",
 		"",
 		"## Recent messages",
@@ -278,13 +290,18 @@ export function buildExtractionPrompt(paths: MemoryPaths, transcript: string, ne
 	].join("\n");
 }
 
-export function parseExtractResponse(text: string): { ops: unknown[] } | null {
-	const start = text.indexOf("{");
-	const end = text.lastIndexOf("}");
-	if (start === -1 || end <= start) return null;
+export type MemoryReply = { readonly kind: "read"; readonly files: readonly string[] } | { readonly kind: "apply"; readonly ops: readonly unknown[] };
+
+export function parseExtractResponse(text: string): MemoryReply | null {
 	try {
-		const parsed = JSON.parse(text.slice(start, end + 1)) as { ops?: unknown };
-		if (Array.isArray(parsed.ops)) return { ops: parsed.ops };
+		const parsed: unknown = JSON.parse(text);
+		if (typeof parsed !== "object" || parsed === null) return null;
+		if ("ops" in parsed && Array.isArray(parsed.ops) && !("read" in parsed)) return { kind: "apply", ops: parsed.ops };
+		if ("read" in parsed && Array.isArray(parsed.read) && !("ops" in parsed)) {
+			const files: string[] = [];
+			for (const file of parsed.read) { if (typeof file !== "string") return null; files.push(file); }
+			return { kind: "read", files };
+		}
 		return null;
 	} catch {
 		return null;

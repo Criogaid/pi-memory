@@ -30,6 +30,7 @@ import {
 	convertToLlm,
 	getAgentDir,
 	serializeConversation,
+	truncateTail,
 	withFileMutationQueue,
 	type ExtensionAPI,
 	type ExtensionContext,
@@ -47,7 +48,6 @@ import {
 } from "./config.js";
 import { serializeMemory, slugName, stampProvenance } from "./frontmatter.js";
 import {
-	applyExtractOps,
 	buildDreamPrompt,
 	buildExtractionPrompt,
 	checkExtractionGates,
@@ -56,10 +56,10 @@ import {
 	flattenIndexLine,
 	isDreamPrompt,
 	normalizeContent,
-	parseExtractResponse,
 } from "./extract.js";
 import { buildIndexSection, buildMemoryPromptSection, buildPinnedSection } from "./prompt.js";
 import { RecallSession, recallForPrompt } from "./recall.js";
+import { MemoryJobs } from "./workflow.js";
 import {
 	ensureDirs,
 	formatIndexLine,
@@ -78,39 +78,13 @@ const PAUSED_MESSAGE = "Memory is paused. Run /pause-memory to resume automemory
 // Pause gates every tool that touches memory-dir files. Claude Code denies
 // memory-dir Read AND Write while paused ("will not write or read new memories").
 const MEMORY_TOOLS = new Set(["read", "write", "edit", "memory_save"]);
-const TRANSCRIPT_MAX_CHARS = 24_000;
+const TRANSCRIPT_MAX_BYTES = 24_000;
 // Minimal observability, mirroring Claude Code's n() debug logging for memory.
 const DEBUG = Boolean(process.env.PI_MEMORY_DEBUG?.trim());
 function debug(message: string, ...rest: unknown[]) {
 	if (DEBUG) console.error("[pi-memory]", message, ...rest);
 }
 
-/** Minimal structural view of ExtensionContext used by the extraction flow. */
-interface RunCtx {
-	model?: unknown;
-	modelRegistry: {
-		complete: (
-			model: unknown,
-			params: unknown,
-			opts: Record<string, unknown>,
-		) => Promise<{ content: Array<{ type: string; text?: string }> }>;
-	};
-	signal?: AbortSignal | undefined;
-	sessionManager: {
-		getBranch: () => unknown[];
-		getEntries: () => unknown[];
-		buildContextEntries?: () => unknown[];
-	};
-	ui?: { setStatus?: (key: string, value: string) => void };
-}
-
-interface EntryLike {
-	type?: string;
-	id?: string;
-	customType?: string;
-	data?: Record<string, unknown>;
-	message?: { role?: string; content?: unknown };
-}
 
 export default function piMemoryExtension(pi: ExtensionAPI) {
 	// Single-instance guard: installing the extension globally AND in a project
@@ -124,6 +98,7 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 	}
 	(globalThis as Record<string, unknown>)[guardKey] = true;
 	pi.on("session_shutdown", async () => {
+		invalidateJobs();
 		delete (globalThis as Record<string, unknown>)[guardKey];
 	});
 
@@ -140,10 +115,21 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 	let lastExtractedId: string | null = null;
 	let directWriteSinceExtract = false;
 	let sessionId = uuidv7();
-
-	const setStatus = (ctx: unknown, text: string) => {
-		(ctx as RunCtx | null | undefined)?.ui?.setStatus?.("pi-memory", text);
+	const jobs = new MemoryJobs();
+	let generation = 0;
+	let parentSystemPrompt: string | undefined;
+	const invalidateJobs = () => { generation++; jobs.cancel(); };
+	pi.on("session_before_switch", invalidateJobs);
+	pi.on("session_before_fork", invalidateJobs);
+	pi.on("session_before_tree", invalidateJobs);
+	pi.on("session_before_compact", invalidateJobs);
+	const recordDirectWrite = () => {
+		invalidateJobs();
+		directWriteSinceExtract = true;
+		pi.appendEntry("pi-memory:write", {});
 	};
+
+	const setStatus = (ctx: ExtensionContext, text: string) => ctx.ui.setStatus("pi-memory", text);
 
 	const statusText = () => {
 		const files = listMemories(paths).length;
@@ -165,15 +151,12 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 		recallSession.snapshot(paths);
 	};
 
-	/** Active branch with compaction applied — what the model actually sees. */
-	const activeEntries = (ctx: RunCtx): unknown[] =>
-		ctx.sessionManager.buildContextEntries?.() ?? ctx.sessionManager.getBranch();
 
 	/** pi's own compaction-style transcript for the extraction model call. */
-	const renderTranscript = (messages: unknown[]): string => {
-		const serialized = serializeConversation(convertToLlm(messages as never[]));
-		if (serialized.length <= TRANSCRIPT_MAX_CHARS) return serialized;
-		return serialized.slice(serialized.length - TRANSCRIPT_MAX_CHARS);
+	const renderTranscript = (messages: Parameters<typeof convertToLlm>[0]): string => {
+		const serialized = serializeConversation(convertToLlm(messages));
+		const clipped = truncateTail(serialized, { maxBytes: TRANSCRIPT_MAX_BYTES });
+		return clipped.truncated ? `[Earlier transcript omitted (${clipped.truncatedBy} limit); the first displayed record may be partial.]\n${clipped.content}` : clipped.content;
 	};
 
 	// State follows selected ancestry; recall follows visible context after compaction.
@@ -183,17 +166,20 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 		directWriteSinceExtract = false;
 		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type !== "custom" || typeof entry.data !== "object" || entry.data === null) continue;
-			if (entry.customType === "pi-memory:extracted" && "lastExtractedId" in entry.data && typeof entry.data.lastExtractedId === "string")
+			if (entry.customType === "pi-memory:write") directWriteSinceExtract = true;
+			if ((entry.customType === "pi-memory:extracted" || entry.customType === "pi-memory:extraction-cursor") && "lastExtractedId" in entry.data && typeof entry.data.lastExtractedId === "string") {
 				lastExtractedId = entry.data.lastExtractedId;
+				directWriteSinceExtract = false;
+			}
 			if (entry.customType === "pi-memory:state" && "paused" in entry.data && typeof entry.data.paused === "boolean")
 				paused = entry.data.paused;
 		}
 	};
 
 	/** Run the gated extraction flow; returns a human-readable result line. */
-	const runExtraction = async (ctx: RunCtx, force: boolean): Promise<string> => {
+	const runExtraction = async (ctx: ExtensionContext, force: boolean): Promise<string> => {
 		if (!enabled || paused) return paused ? PAUSED_MESSAGE : "Memory is disabled for this session.";
-		const branch = activeEntries(ctx) as EntryLike[];
+		const branch = ctx.sessionManager.buildContextEntries();
 		const { views, lastEntryId } = collectEntriesSince(branch, lastExtractedId);
 		const recent = views.length > 0 ? views : force ? collectEntriesSince(branch, null).views.slice(-10) : [];
 		if (recent.length === 0 && !force) return "skipped: no new messages since the last extraction";
@@ -214,49 +200,32 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 		}
 
 		const prompt = buildExtractionPrompt(paths, renderTranscript(recent.map((view) => view.message)), recent.length);
-		const model = ctx.model;
-		if (!model) return "no active model";
+		const startedGeneration = generation;
 		setStatus(ctx, "memory: extracting…");
 		try {
-			const response = await ctx.modelRegistry.complete(
-				model,
-				{
-					messages: [
-						{
-							role: "user" as const,
-							content: [{ type: "text" as const, text: prompt }],
-							timestamp: Date.now(),
-						},
-					],
-				},
-				{ maxTokens: 4096, signal: ctx.signal, cacheRetention: "none", sessionId: uuidv7() },
-			);
-			const text = response.content
-				.filter((block) => block.type === "text")
-				.map((block) => block.text ?? "")
-				.join("\n");
-			const parsed = parseExtractResponse(text);
-			if (!parsed) return "extraction produced no parsable ops";
-			const result = await applyExtractOps(paths, parsed.ops, sessionId);
-			lastExtractedId = lastEntryId ?? lastExtractedId;
-			directWriteSinceExtract = false;
-			pi.appendEntry("pi-memory:extracted", { lastExtractedId, written: result.written });
-			if (result.applied === 0) {
-				return `nothing saved${result.skipped.length ? ` (${result.skipped[0]})` : ""}`;
+			const result = await jobs.run(ctx, {
+				kind: "extract", paths, sessionId, prompt,
+				systemPrompt: (parentSystemPrompt ?? ctx.getSystemPrompt()) + "\n\n" + buildMemoryPromptSection(paths, config.citeMemories),
+			});
+			if (startedGeneration !== generation) return `extraction cancelled after session state changed; ${result.applied} operation(s) already applied`;
+			if (result.status === "completed") {
+				lastExtractedId = lastEntryId ?? lastExtractedId;
+				directWriteSinceExtract = false;
 			}
-			return (
-				`saved ${result.applied} memor${result.applied === 1 ? "y" : "ies"}: ${result.written.join(", ")}` +
-				(result.skipped.length ? `; skipped ${result.skipped.length}: ${result.skipped.join("; ")}` : "")
-			);
+			if (result.status === "completed" || result.applied > 0)
+				pi.appendEntry("pi-memory:extracted", { lastExtractedId, written: result.written, status: result.status });
+			return `extraction ${result.status}: ${result.applied} operation(s)${result.errors.length ? `; ${result.errors.join("; ")}` : ""}`;
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			return `extraction failed: ${message}`;
 		} finally {
-			setStatus(ctx, statusText());
+			if (startedGeneration === generation) setStatus(ctx, statusText());
 		}
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
+		invalidateJobs();
+		parentSystemPrompt = undefined;
 		cwd = ctx.cwd;
 		config = loadConfig(cwd);
 		paths = resolvePaths(cwd, config);
@@ -269,12 +238,7 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 		paused = false;
 		lastExtractedId = null;
 		directWriteSinceExtract = false;
-		try {
-			const id = (ctx.sessionManager as unknown as { getSessionId?: () => string }).getSessionId?.();
-			if (id) sessionId = id;
-		} catch {
-			// keep the generated id
-		}
+		sessionId = ctx.sessionManager.getSessionId();
 		restoreBranchState(ctx);
 		snapshotMemoryPrompt();
 		debug("session_start: snapshot chars:", memoryPromptSnapshot.length, "cursor:", lastExtractedId);
@@ -300,13 +264,13 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 		}
 	};
 
-	const maybeNudgeDream = async (ctx: unknown) => {
+	const maybeNudgeDream = async (ctx: ExtensionContext) => {
 		try {
 			const { SessionManager } = await import("@earendil-works/pi-coding-agent");
 			const sessions = await SessionManager.list(cwd);
 			const lastDream = dreamTimestamp();
 			if (sessions.length >= 5 && Date.now() - lastDream > 24 * 3600_000) {
-				(ctx as RunCtx | null | undefined)?.ui?.setStatus?.("pi-memory", "memory: due for /dream");
+				setStatus(ctx, "memory: due for /dream");
 				debug("dream nudge: sessions", sessions.length, "last dream", new Date(lastDream).toISOString());
 			}
 		} catch (error) {
@@ -322,11 +286,14 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 	};
 
 	pi.on("session_tree", async (_event, ctx) => {
+		invalidateJobs();
 		restoreBranchState(ctx);
 		setStatus(ctx, statusText());
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
+		invalidateJobs();
+		parentSystemPrompt = event.systemPrompt;
 		if (!enabled) return;
 		setStatus(ctx, statusText());
 
@@ -407,7 +374,7 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 		const absolute = resolveToolPath(target, ctx.cwd);
 		// rUn counts any Write/Edit inside the memory dir as a direct write
 		// (no extension filter); HD's stamp itself only touches .md files.
-		directWriteSinceExtract = true;
+		recordDirectWrite();
 		if (!target.endsWith(".md")) return;
 		// Stamp provenance the way Claude Code's stampNewMemoryContent does:
 		// add originSessionId/modified when missing, refresh modified otherwise.
@@ -432,24 +399,21 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 	let extractionPending = false;
 	pi.on("agent_settled", async (_event, ctx) => {
 		if (!enabled || !config.autoExtract || paused) return;
-		if (extractionInFlight) {
-			extractionPending = true;
-			return;
-		}
+		if (extractionInFlight) { extractionPending = true; return; }
 		extractionInFlight = true;
-		let result: string;
+		let result = "";
+		const startedGeneration = generation;
 		try {
-			result = await runExtraction(ctx as unknown as RunCtx, false);
+			do {
+				extractionPending = false;
+				result = await runExtraction(ctx, false);
+			} while (extractionPending && startedGeneration === generation && enabled && !paused && config.autoExtract);
 		} finally {
 			extractionInFlight = false;
 		}
-		if (extractionPending) {
-			extractionPending = false;
-			result = await runExtraction(ctx as unknown as RunCtx, false);
-		}
 		// Surface the outcome (or the skip reason) so a silent no-op is never
 		// mistaken for a completed extraction.
-		if (ctx.hasUI && !result.startsWith("skipped: no new messages")) {
+		if (startedGeneration === generation && ctx.hasUI && !result.startsWith("skipped: no new messages")) {
 			ctx.ui.notify(`pi-memory: ${result}`, "info");
 		}
 	});
@@ -541,7 +505,7 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 				indexLine: params.indexLine?.trim() ? flattenIndexLine(normalizeContent(params.indexLine)) : formatIndexLine(ref, name, description),
 			});
 			if (!saved.ok) return toolError(saved.error);
-			directWriteSinceExtract = true;
+			recordDirectWrite();
 			setStatus(ctx, statusText());
 			return {
 				content: [
@@ -604,6 +568,7 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 			switch (choice) {
 				case `Toggle pause (${paused ? "resume" : "pause"} memory for this session)`:
 					paused = !paused;
+					invalidateJobs();
 					pi.appendEntry("pi-memory:state", { paused });
 					ctx.ui.notify(
 						paused
@@ -613,7 +578,7 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 					);
 					break;
 				case "Extract memories from this session now":
-					ctx.ui.notify(await runExtraction(ctx as unknown as RunCtx, true), "info");
+					ctx.ui.notify(await runExtraction(ctx, true), "info");
 					break;
 				case "Run a dream (memory consolidation)":
 					if (!enabled || paused) { ctx.ui.notify(paused ? PAUSED_MESSAGE : "Memory is disabled for this session.", "warning"); break; }
@@ -625,6 +590,7 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 					break;
 				case `Turn pi-memory ${enabled ? "off" : "on"} for this session`:
 					enabled = !enabled;
+					invalidateJobs();
 					// Drop memory_save from the active tool set when disabled so
 					// the model never sees it (execute() still guards as backup).
 					{
@@ -658,6 +624,7 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 		description: "Pause automemory for this session",
 		handler: async (_args, ctx) => {
 			paused = !paused;
+			invalidateJobs();
 			pi.appendEntry("pi-memory:state", { paused });
 			ctx.ui.notify(
 				paused
@@ -672,7 +639,7 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 	pi.registerCommand("memory-extract", {
 		description: "Extract memories from this session now",
 		handler: async (_args, ctx) => {
-			ctx.ui.notify(await runExtraction(ctx as unknown as RunCtx, true), "info");
+			ctx.ui.notify(await runExtraction(ctx, true), "info");
 		},
 	});
 

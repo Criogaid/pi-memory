@@ -78,6 +78,7 @@ function mkCtx(opts: { complete?: Function } = {}) {
 			getSessionId: () => "sess-e2e",
 		},
 		model: { id: "mock-model" },
+		getSystemPrompt: () => "",
 		modelRegistry: { complete: opts.complete ?? (async () => { throw new Error("no model call expected"); }) },
 		signal: undefined,
 		waitForIdle: async () => {},

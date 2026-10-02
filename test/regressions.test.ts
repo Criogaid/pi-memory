@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { test } from "node:test";
 import { SessionManager, type ExtensionAPI, type ExtensionContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { BeforeAgentStartEventResult } from "@earendil-works/pi-coding-agent";
+import type { Context } from "@earendil-works/pi-ai";
 import factory from "../src/index.ts";
 import { LIMITS, resolvePaths } from "../src/config.ts";
 import { applyExtractOps, collectEntriesSince } from "../src/extract.ts";
@@ -34,11 +35,17 @@ async function createSession() {
 	const manager = SessionManager.inMemory(cwd);
 	const notifications: string[] = [];
 	let modelCalls = 0;
+	let modelReply: (request: Context) => Promise<string> | string = () => '{"ops":[]}';
+	const parentRule = crypto.randomUUID();
 	const config = { memoryDir: path.join(root, "mem"), sharedMemory: true, autoExtract: true, autoExtractMinMessages: 1, recall: true, citeMemories: false };
 	// Only host boundary objects are mocked; history and persistence use the real implementations.
 	const ctx = {
 		cwd, hasUI: true, sessionManager: manager, model: { id: "test-model" },
-		modelRegistry: { complete: async () => { modelCalls++; return { content: [{ type: "text", text: '{"ops":[]}' }] }; } },
+		modelRegistry: { complete: async (_model: unknown, request: Context) => {
+			modelCalls++;
+			return { role: "assistant", stopReason: "stop", content: [{ type: "text", text: await modelReply(request) }], timestamp: Date.now() };
+		} },
+		getSystemPrompt: () => parentRule,
 		ui: { notify: (text: string) => notifications.push(text), setStatus: () => {}, select: async () => undefined },
 		waitForIdle: async () => {},
 	} as unknown as ExtensionContext;
@@ -73,6 +80,8 @@ async function createSession() {
 	return {
 		root, cwd, config, paths: resolvePaths(cwd, config), manager, notifications, emit, command, save, turn,
 		modelCalls: () => modelCalls,
+		parentRule,
+		setModelReply: (reply: typeof modelReply) => { modelReply = reply; },
 		addUser: (text: string) => manager.appendMessage({ role: "user", content: text, timestamp: Date.now() }),
 		close: async () => {
 			await emit("session_shutdown");
@@ -344,4 +353,123 @@ test("extraction restores its consumed cursor after session reload", async () =>
 	await s.emit("session_start");
 	await s.emit("agent_settled");
 	assert.equal(s.modelCalls(), 1);
+}));
+
+test("extraction reads complete prior content and inherits parent context before updating", async () => withSession(async (s) => {
+	const prior = crypto.randomUUID();
+	const added = crypto.randomUUID();
+	const file = path.join(s.paths.personalDir, "policy.md");
+	fs.writeFileSync(file, memory("policy", prior, true));
+	let calls = 0;
+	s.setModelReply((request) => {
+		assert.ok(request.systemPrompt?.includes(s.parentRule));
+		if (++calls === 1) return JSON.stringify({ read: ["policy.md"] });
+		assert.ok(JSON.stringify(request.messages).includes(prior));
+		return JSON.stringify({ ops: [{ op: "upsert", file: "policy.md", type: "project", description: "Policy", body: `${prior}\n${added}` }] });
+	});
+	await s.command("memory-extract");
+	const saved = parseMemory(fs.readFileSync(file, "utf8"));
+	assert.ok(saved.body.includes(prior) && saved.body.includes(added));
+	assert.equal(saved.frontmatter.pinned, true);
+	assert.equal(saved.frontmatter.originSessionId, "test");
+}));
+
+test("an extraction cannot replace a file changed after its model read", async () => withSession(async (s) => {
+	const file = path.join(s.paths.personalDir, "policy.md");
+	fs.writeFileSync(file, memory("policy", crypto.randomUUID()));
+	const concurrent = memory("policy", crypto.randomUUID());
+	let calls = 0;
+	s.setModelReply(() => {
+		if (++calls === 1) return JSON.stringify({ read: ["policy.md"] });
+		fs.writeFileSync(file, concurrent);
+		return JSON.stringify({ ops: [{ op: "upsert", file: "policy.md", type: "project", description: "Policy", body: crypto.randomUUID() }] });
+	});
+	await s.command("memory-extract");
+	assert.equal(fs.readFileSync(file, "utf8"), concurrent);
+}));
+
+test("pause discards a late model response before it can write", async () => withSession(async (s) => {
+	const response = Promise.withResolvers<string>();
+	const started = Promise.withResolvers<void>();
+	s.setModelReply(() => { started.resolve(); return response.promise; });
+	s.addUser("Remember this durable project preference");
+	const extraction = s.emit("agent_settled");
+	await started.promise;
+	await s.command("pause-memory");
+	response.resolve(JSON.stringify({ ops: [{ op: "upsert", file: "late.md", type: "project", description: "Late", body: crypto.randomUUID() }] }));
+	await extraction;
+	assert.equal(fs.existsSync(path.join(s.paths.personalDir, "late.md")), false);
+	assert.ok(!s.manager.getBranch().some((entry) => entry.type === "custom" && entry.customType === "pi-memory:extracted"));
+}));
+
+test("changing session during extraction prevents writes and cursor updates", async () => withSession(async (s) => {
+	const response = Promise.withResolvers<string>();
+	const started = Promise.withResolvers<void>();
+	s.setModelReply(() => { started.resolve(); return response.promise; });
+	s.addUser("Remember this durable project preference");
+	const extraction = s.emit("agent_settled");
+	await started.promise;
+	await s.emit("session_before_switch");
+	s.manager.newSession();
+	await s.emit("session_start");
+	response.resolve(JSON.stringify({ ops: [{ op: "upsert", file: "old-session.md", type: "project", description: "Late", body: crypto.randomUUID() }] }));
+	await extraction;
+	assert.equal(fs.existsSync(path.join(s.paths.personalDir, "old-session.md")), false);
+	assert.ok(!s.manager.getBranch().some((entry) => entry.type === "custom" && entry.customType === "pi-memory:extracted"));
+}));
+
+test("a direct-write skip remains consumed across session reload", async () => withSession(async (s) => {
+	s.addUser("Remember this durable project preference");
+	await s.save("preference");
+	await s.emit("agent_settled");
+	await s.emit("session_start");
+	await s.emit("agent_settled");
+	assert.equal(s.modelCalls(), 0);
+	s.addUser("Remember an additional durable project preference");
+	await s.emit("agent_settled");
+	assert.equal(s.modelCalls(), 1);
+}));
+
+test("extraction requests a read instead of replacing unseen existing content", async () => withSession(async (s) => {
+	const file = path.join(s.paths.personalDir, "policy.md");
+	const original = memory("policy", crypto.randomUUID());
+	fs.writeFileSync(file, original);
+	s.setModelReply(() => JSON.stringify({ ops: [{ op: "upsert", file: "policy.md", type: "project", description: "Policy", body: crypto.randomUUID() }] }));
+	await s.command("memory-extract");
+	assert.ok(s.modelCalls() > 1);
+	assert.equal(fs.readFileSync(file, "utf8"), original);
+}));
+
+test("a structured extraction batch observes its own earlier successful writes", async () => withSession(async (s) => {
+	const names = ["first-policy", "second-policy"];
+	const payload = crypto.randomUUID();
+	s.setModelReply(() => JSON.stringify({ ops: names.map((name) => ({ op: "upsert", file: `${name}.md`, type: "project", description: name, body: payload })) }));
+	await s.command("memory-extract");
+	for (const name of names) assert.equal(parseMemory(fs.readFileSync(path.join(s.paths.personalDir, `${name}.md`), "utf8")).body.trim(), payload);
+}));
+
+test("cancellation prevents queued effects while preserving earlier committed operations", async () => withSession(async (s) => {
+	const { withFileMutationQueue } = await import("@earendil-works/pi-coding-agent");
+	const released = Promise.withResolvers<void>();
+	const locked = Promise.withResolvers<void>();
+	const second = path.join(s.paths.personalDir, "second.md");
+	const holding = withFileMutationQueue(second, async () => { locked.resolve(); await released.promise; });
+	await locked.promise;
+	s.setModelReply(() => JSON.stringify({ ops: ["first.md", "second.md"].map((file) => ({ op: "upsert", file, type: "project", description: file, body: crypto.randomUUID() })) }));
+	const firstWritten = Promise.withResolvers<void>();
+	const notificationTimeoutMs = 5000;
+	const timeout = setTimeout(() => firstWritten.reject(new Error("No committed file notification")), notificationTimeoutMs);
+	const watcher = fs.watch(s.paths.personalDir, () => {
+		if (fs.existsSync(path.join(s.paths.personalDir, "first.md"))) firstWritten.resolve();
+	});
+	const extraction = s.command("memory-extract");
+	try {
+		await firstWritten.promise;
+		assert.equal(fs.existsSync(path.join(s.paths.personalDir, "first.md")), true);
+		await s.command("pause-memory");
+	} finally { clearTimeout(timeout); watcher.close(); released.resolve(); }
+	await holding;
+	await extraction;
+	assert.equal(fs.existsSync(second), false);
+	assert.equal(fs.existsSync(path.join(s.paths.personalDir, "first.md")), true);
 }));

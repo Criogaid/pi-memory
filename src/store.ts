@@ -275,7 +275,7 @@ async function withQueues<T>(files: readonly string[], run: () => T | Promise<T>
  * Preflight runs inside serialization. Individual replacements are atomic; ordinary
  * failures restore original bytes. A process/OS crash between renames is not a transaction.
  */
-export async function mutateMemory(paths: MemoryPaths, change: MemoryChange, expected?: ReadonlyMap<string, string | null>): Promise<MutationResult> {
+export async function mutateMemory(paths: MemoryPaths, change: MemoryChange, expected?: ReadonlyMap<string, string | null>, signal?: AbortSignal): Promise<MutationResult> {
 	const source = memoryPath(paths, change.ref);
 	const targetRef = change.kind === "promote" ? `team/${change.ref}` : change.ref;
 	if (change.kind === "promote" && change.ref.startsWith("team/")) return { ok: false, error: "Only personal memories can be promoted" };
@@ -283,6 +283,7 @@ export async function mutateMemory(paths: MemoryPaths, change: MemoryChange, exp
 	const index = indexPath(paths);
 	const keys = [...new Set([source, target, index])].sort();
 	return withQueues(keys, () => {
+		signal?.throwIfAborted();
 		// Recheck after waiting: another tool may have replaced a path with a symlink.
 		memoryPath(paths, change.ref);
 		memoryPath(paths, targetRef);
