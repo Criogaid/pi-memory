@@ -9,7 +9,7 @@ import { createEditTool, createWriteTool, initTheme, SessionManager, withFileMut
 import { getKeybindings, type Component, type TUI } from "@earendil-works/pi-tui";
 import { setTimeout as delay } from "node:timers/promises";
 import type { BeforeAgentStartEventResult } from "@earendil-works/pi-coding-agent";
-import type { Api, Context, Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
+import type { Api, AssistantMessage, Context, Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { JobModelKey, JobModelSelection } from "../src/config.ts";
 import type { MemoryJobRequest } from "../src/workflow.ts";
 import { isolateMemoryHome } from "./fixtures/memory-home.ts";
@@ -56,6 +56,7 @@ async function createSession() {
 	const notifications: string[] = [];
 	let modelCalls = 0;
 	let modelReply: (request: Context) => Promise<string> | string = () => '{"ops":[]}';
+	let modelStopReason: AssistantMessage["stopReason"] = "stop";
 	const sessionModel = modelFixture();
 	const registeredModels = [{ model: sessionModel, authenticated: true }];
 	const modelRequests: ModelCall[] = [];
@@ -86,7 +87,7 @@ async function createSession() {
 			streamSimple: (model: Model<Api>, request: Context, options: StreamOptions) => {
 				modelCalls++;
 				modelRequests.push({ model, options: options && { ...options }, thinking: options?.reasoning ?? "off" });
-				return { result: async () => assistantMessage(model, await modelReply(request)) };
+				return { result: async () => ({ ...assistantMessage(model, await modelReply(request)), stopReason: modelStopReason }) };
 			},
 		},
 		getSystemPrompt: () => parentRule,
@@ -141,6 +142,7 @@ async function createSession() {
 		activeTools: () => activeTools,
 		setIdleWaiter: (waiter: () => Promise<void>) => { waitForIdle = waiter; },
 		setModelReply: (reply: typeof modelReply) => { modelReply = reply; },
+		setModelStopReason: (reason: AssistantMessage["stopReason"]) => { modelStopReason = reason; },
 		addUser: (text: string) => manager.appendMessage({ role: "user", content: text, timestamp: Date.now() }),
 		close: async () => {
 			await emit("session_shutdown");
@@ -1140,6 +1142,26 @@ test("stream failures preserve model fallback notices and the provider failure",
 	assert.equal(result.notices?.length, 1);
 	assert.ok(result.errors.some((error) => error.includes(failure)));
 	assert.equal(result.applied, 0);
+}));
+
+test("job requests leave the model's full output limit available for thinking", async () => withSession(async (s) => {
+	const model = modelFixture();
+	s.registerModel(model);
+	for (const kind of ["extract", "dream"] as const) {
+		assert.equal((await runMemoryJob(s, kind, { provider: model.provider, model: model.id, thinkingLevel: "high" })).status, "completed");
+		const options = s.modelRequests.at(-1)?.options;
+		assert.ok((options?.maxTokens ?? model.maxTokens) >= model.maxTokens);
+	}
+}));
+
+test("a reply truncated at the output limit fails without applying its operations", async () => withSession(async (s) => {
+	const file = `${crypto.randomUUID()}.md`, payload = crypto.randomUUID();
+	s.setModelReply(() => JSON.stringify({ ops: [{ op: "upsert", file, type: "project", description: payload, body: payload }] }));
+	s.setModelStopReason("length");
+	const result = await runMemoryJob(s, "extract");
+	assert.equal(result.status, "failed");
+	assert.equal(result.applied, 0);
+	assert.equal(fs.existsSync(path.join(s.paths.personalDir, file)), false);
 }));
 
 test("background cache identity survives read rounds and repeated jobs but separates kind and session", async () => withSession(async (s) => {

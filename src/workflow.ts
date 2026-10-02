@@ -14,7 +14,6 @@ import { containsPath, isValidFileRef, memoryPath, readFileOrNull } from "./stor
 const MAX_TURNS = 5;
 const MAX_CONTEXT_BYTES = 160_000;
 const MAX_READ_BYTES = 32_000;
-const MAX_OUTPUT_TOKENS = 4096;
 const MAX_RESPONSE_BYTES = 32_000;
 const TIMEOUT_MS = 60_000;
 const MAX_PROJECT_FILE_BYTES = 1_000_000;
@@ -116,13 +115,17 @@ async function execute(ctx: ExtensionContext, request: MemoryJobRequest, signal:
 		signal.throwIfAborted();
 		if (Buffer.byteLength(systemPrompt + JSON.stringify(messages), "utf8") > MAX_CONTEXT_BYTES)
 			throw new Error("Memory job context exceeds its bound; no further operations were applied");
-		// Pi's own agent maps "off" to an omitted reasoning option.
+		// Pi's own agent maps "off" to an omitted reasoning option. An omitted maxTokens lets pi-ai use the
+		// model's output limit, as Claude Code does for its memory agents: thinking tokens count against that
+		// limit on most providers, so a small fixed cap would truncate reasoning replies. MAX_TURNS bounds cost.
 		const response = await awaitWithAbort(ctx.modelRegistry.streamSimple(model, { systemPrompt, messages }, {
-			signal, maxTokens: MAX_OUTPUT_TOKENS, sessionId: cacheSessionId, reasoning: thinking === "off" ? undefined : thinking,
+			signal, sessionId: cacheSessionId, reasoning: thinking === "off" ? undefined : thinking,
 		}).result(), signal);
 		signal.throwIfAborted();
 		if (response.stopReason === "error" || response.stopReason === "aborted")
 			throw new Error("Memory model did not complete its response");
+		if (response.stopReason === "length")
+			throw new Error("Memory model response hit its output token limit; no operations from it were applied");
 		const text = response.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
 		if (Buffer.byteLength(text, "utf8") > MAX_RESPONSE_BYTES) throw new Error("Memory response exceeds its byte bound");
 		const reply = parseExtractResponse(text);
