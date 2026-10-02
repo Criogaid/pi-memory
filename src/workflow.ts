@@ -2,7 +2,7 @@
  * No public pi fork API enforces this operation protocol and its read-before-write
  * contract, so this module owns the small turn loop and cancellation boundary.
  */
-import { getSupportedThinkingLevels, uuidv7, type Api, type Message, type Model, type ThinkingLevel } from "@earendil-works/pi-ai";
+import { getSupportedThinkingLevels, uuidv7, type Api, type Message, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { createReadTool, type ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -41,7 +41,8 @@ export interface MemoryJobResult {
 
 interface ResolvedJobModel {
 	readonly model: Model<Api> | undefined;
-	readonly reasoning?: ThinkingLevel;
+	/** Absent sends no thinking options, so the provider applies its own default. */
+	readonly thinking?: ModelThinkingLevel;
 	readonly notices: readonly string[];
 }
 
@@ -58,8 +59,7 @@ export function resolveJobModel(ctx: ExtensionContext, selection: JobModelSelect
 	if (level === undefined) {
 		return { model: configured, notices: [`Thinking level ${selection.thinkingLevel} is not supported by ${configured.provider}/${configured.id}; used the provider default`] };
 	}
-	// Pi's own agent maps "off" to an omitted reasoning option.
-	return { model: configured, reasoning: level === "off" ? undefined : level, notices: [] };
+	return { model: configured, thinking: level, notices: [] };
 }
 
 /** One active memory job per extension instance; cancellation prevents queued effects. */
@@ -93,7 +93,7 @@ export class MemoryJobs {
 }
 
 async function execute(ctx: ExtensionContext, request: MemoryJobRequest, signal: AbortSignal, resolved: ResolvedJobModel): Promise<MemoryJobResult> {
-	const { model, reasoning } = resolved;
+	const { model, thinking } = resolved;
 	if (!model) throw new Error("No active model for the memory job");
 	const observations = new Map<string, string | null>();
 	// Repeated jobs share the inherited system prefix, so a stable per-session, per-kind key lets
@@ -109,10 +109,15 @@ async function execute(ctx: ExtensionContext, request: MemoryJobRequest, signal:
 		signal.throwIfAborted();
 		if (Buffer.byteLength(systemPrompt + JSON.stringify(messages), "utf8") > MAX_CONTEXT_BYTES)
 			throw new Error("Memory job context exceeds its bound; no further operations were applied");
-		// Provider-neutral options let a configured thinking level reach any provider.
-		const response = await awaitWithAbort(ctx.modelRegistry.streamSimple(model, { systemPrompt, messages }, {
-			signal, maxTokens: MAX_OUTPUT_TOKENS, sessionId: cacheSessionId, reasoning,
-		}).result(), signal);
+		const options = { signal, maxTokens: MAX_OUTPUT_TOKENS, sessionId: cacheSessionId };
+		// streamSimple turns thinking off when reasoning is absent, so only an explicit level uses it;
+		// otherwise the request carries no thinking options and the provider default applies.
+		// Pi's own agent maps "off" to an omitted reasoning option.
+		const response = await awaitWithAbort(thinking === undefined
+			? ctx.modelRegistry.complete(model, { systemPrompt, messages }, options)
+			: ctx.modelRegistry.streamSimple(model, { systemPrompt, messages }, {
+				...options, reasoning: thinking === "off" ? undefined : thinking,
+			}).result(), signal);
 		signal.throwIfAborted();
 		if (response.stopReason === "error" || response.stopReason === "aborted")
 			throw new Error("Memory model did not complete its response");

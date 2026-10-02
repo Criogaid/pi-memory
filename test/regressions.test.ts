@@ -9,7 +9,7 @@ import { createEditTool, createWriteTool, initTheme, SessionManager, withFileMut
 import { getKeybindings, type Component, type TUI } from "@earendil-works/pi-tui";
 import { setTimeout as delay } from "node:timers/promises";
 import type { BeforeAgentStartEventResult } from "@earendil-works/pi-coding-agent";
-import type { Api, Context, Model } from "@earendil-works/pi-ai";
+import type { Api, Context, Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { JobModelKey, JobModelSelection } from "../src/config.ts";
 import type { MemoryJobRequest } from "../src/workflow.ts";
 import { isolateMemoryHome } from "./fixtures/memory-home.ts";
@@ -32,7 +32,9 @@ assert.equal(expandHome("~"), path.join(homeRoot, "home"));
 type Handler = (event: unknown, ctx: ExtensionContext) => unknown | Promise<unknown>;
 interface Command { handler: (args: string, ctx: ExtensionContext) => unknown | Promise<unknown>; getArgumentCompletions?: RegisteredCommand["getArgumentCompletions"]; }
 type StreamOptions = Parameters<ExtensionContext["modelRegistry"]["streamSimple"]>[2];
-interface ModelCall { readonly model: Model<Api>; readonly options: StreamOptions; }
+/** Thinking as sent: "provider-default" carries no thinking options; "off" disables thinking explicitly. */
+type RequestedThinking = ModelThinkingLevel | "provider-default";
+interface ModelCall { readonly model: Model<Api>; readonly options: StreamOptions; readonly thinking: RequestedThinking; }
 
 async function withSession(run: (session: Awaited<ReturnType<typeof createSession>>) => Promise<void>) {
 	const session = await createSession();
@@ -83,8 +85,13 @@ async function createSession() {
 			getAvailable: () => registeredModels.filter((entry) => entry.authenticated).map((entry) => entry.model),
 			streamSimple: (model: Model<Api>, request: Context, options: StreamOptions) => {
 				modelCalls++;
-				modelRequests.push({ model, options: options && { ...options } });
+				modelRequests.push({ model, options: options && { ...options }, thinking: options?.reasoning ?? "off" });
 				return { result: async () => assistantMessage(model, await modelReply(request)) };
+			},
+			complete: async (model: Model<Api>, request: Context, options: StreamOptions) => {
+				modelCalls++;
+				modelRequests.push({ model, options: options && { ...options }, thinking: "provider-default" });
+				return assistantMessage(model, await modelReply(request));
 			},
 		},
 		getSystemPrompt: () => parentRule,
@@ -1067,12 +1074,12 @@ test("reapplying current memory and pause settings does not cancel extraction", 
 	assert.equal(parseMemory(fs.readFileSync(path.join(s.paths.personalDir, "uninterrupted.md"), "utf8")).body.trim(), payload);
 }));
 
-test("unconfigured jobs use the foreground model without overriding reasoning", async () => withSession(async (s) => {
+test("unconfigured jobs use the foreground model with provider-default thinking", async () => withSession(async (s) => {
 	for (const kind of ["extract", "dream"] as const) {
 		const result = await runMemoryJob(s, kind);
 		assert.equal(result.status, "completed");
 		assert.equal(s.modelRequests.at(-1)?.model, s.ctx.model);
-		assert.equal(s.modelRequests.at(-1)?.options?.reasoning, undefined);
+		assert.equal(s.modelRequests.at(-1)?.thinking, "provider-default");
 		assert.equal(result.notices?.length ?? 0, 0);
 	}
 }));
@@ -1084,7 +1091,7 @@ for (const thinkingLevel of [undefined, "high", "off"] as const) {
 		const result = await runMemoryJob(s, "extract", { provider: model.provider, model: model.id, thinkingLevel });
 		assert.equal(result.status, "completed");
 		assert.equal(s.modelRequests.at(-1)?.model, model);
-		assert.equal(s.modelRequests.at(-1)?.options?.reasoning, thinkingLevel === "off" ? undefined : thinkingLevel);
+		assert.equal(s.modelRequests.at(-1)?.thinking, thinkingLevel ?? "provider-default");
 		assert.equal(result.notices?.length ?? 0, 0);
 	}));
 }
@@ -1099,7 +1106,7 @@ for (const available of ["missing", "unauthenticated"] as const) {
 		assert.equal(result.applied, 1);
 		assert.equal(result.notices?.length, 1);
 		assert.equal(s.modelRequests.at(-1)?.model, s.ctx.model);
-		assert.equal(s.modelRequests.at(-1)?.options?.reasoning, undefined);
+		assert.equal(s.modelRequests.at(-1)?.thinking, "provider-default");
 		assert.equal(parseMemory(fs.readFileSync(path.join(s.paths.personalDir, "fallback.md"), "utf8")).body.trim(), payload);
 	}));
 }
@@ -1110,7 +1117,7 @@ test("unsupported reasoning keeps the selected model and reports a notice", asyn
 	const result = await runMemoryJob(s, "dream", { provider: model.provider, model: model.id, thinkingLevel: "high" });
 	assert.equal(result.status, "completed");
 	assert.equal(s.modelRequests.at(-1)?.model, model);
-	assert.equal(s.modelRequests.at(-1)?.options?.reasoning, undefined);
+	assert.equal(s.modelRequests.at(-1)?.thinking, "provider-default");
 	assert.equal(result.notices?.length, 1);
 }));
 
@@ -1201,8 +1208,8 @@ test("extraction and Dream use independent configured models without changing th
 	s.addUser(crypto.randomUUID());
 	await s.command("memory-extract");
 	await s.command("dream");
-	assert.deepEqual(s.modelRequests.map(({ model, options }) => ({ model, reasoning: options?.reasoning })), [
-		{ model: extract, reasoning: "high" }, { model: dream, reasoning: "low" },
+	assert.deepEqual(s.modelRequests.map(({ model, thinking }) => ({ model, thinking })), [
+		{ model: extract, thinking: "high" }, { model: dream, thinking: "low" },
 	]);
 	assert.equal(s.ctx.model, foreground);
 	assert.ok(readDreamState(s.paths).lastCompletedAt !== null);
@@ -1274,7 +1281,7 @@ for (const { key } of JOB_MODEL_SETTINGS) {
 		assert.deepEqual(loadConfig(s.cwd)[key], { provider: model.provider, model: model.id, thinkingLevel });
 		await s.command(key === "extractModel" ? "memory-extract" : "dream");
 		assert.equal(s.modelRequests.at(-1)?.model, model);
-		assert.equal(s.modelRequests.at(-1)?.options?.reasoning, thinkingLevel === "off" ? undefined : thinkingLevel);
+		assert.equal(s.modelRequests.at(-1)?.thinking, thinkingLevel);
 	}));
 }
 
@@ -1326,7 +1333,7 @@ test("choosing the session model persists null over global config and updates th
 	assert.equal(loadConfig(s.cwd).dreamModel, undefined);
 	await s.command("dream");
 	assert.equal(s.modelRequests.at(-1)?.model, s.ctx.model);
-	assert.equal(s.modelRequests.at(-1)?.options?.reasoning, undefined);
+	assert.equal(s.modelRequests.at(-1)?.thinking, "provider-default");
 }));
 
 test("choosing provider thinking defaults removes a previously configured level", async () => withSession(async (s) => {
@@ -1344,7 +1351,7 @@ test("choosing provider thinking defaults removes a previously configured level"
 	assert.deepEqual(loadConfig(s.cwd).extractModel, { provider: model.provider, model: model.id });
 	await s.command("memory-extract");
 	assert.equal(s.modelRequests.at(-1)?.model, model);
-	assert.equal(s.modelRequests.at(-1)?.options?.reasoning, undefined);
+	assert.equal(s.modelRequests.at(-1)?.thinking, "provider-default");
 }));
 
 test("RPC settings summary delivers both configured model identities", async () => withSession(async (s) => {
