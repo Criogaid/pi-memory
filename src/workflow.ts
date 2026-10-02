@@ -148,9 +148,9 @@ async function readProjectFile(root: string, reader: ReturnType<typeof createRea
 	let absolute: string;
 	try { absolute = fs.realpathSync(path.resolve(root, file)); }
 	catch (error) {
-		if (!containsPath(root, path.resolve(root, file))) throw new Error("Project read is outside the current project");
-		if (isMissingPath(error)) return { error: "File not found in the current project" };
-		throw error;
+		if (!isMissingPath(error)) throw error;
+		if (!missingPathStaysInside(root, path.resolve(root, file))) throw new Error("Project read is outside the current project");
+		return { error: "File not found in the current project" };
 	}
 	if (!containsPath(root, absolute)) throw new Error("Project read is outside the current project");
 	const stat = fs.statSync(absolute);
@@ -158,6 +158,30 @@ async function readProjectFile(root: string, reader: ReturnType<typeof createRea
 	const result = await awaitWithAbort(reader.execute(uuidv7(), { path: absolute }, signal), signal);
 	if (result.content.some((part) => part.type !== "text")) return { error: "Project reads require text files" };
 	return { content: result.content.filter((part) => part.type === "text").map((part) => part.text).join("\n") };
+}
+
+/**
+ * realpath cannot resolve a path through a dangling link, so follow existing components and
+ * links by hand: a missing path counts as inside only if every hop it takes stays in the root.
+ */
+function missingPathStaysInside(root: string, lexical: string): boolean {
+	if (!containsPath(root, lexical)) return false;
+	const pending = path.relative(root, lexical).split(path.sep).filter(Boolean);
+	let current = root;
+	for (let hops = 0; pending.length > 0;) {
+		const next = path.join(current, pending.shift() as string);
+		let entry: fs.Stats;
+		try { entry = fs.lstatSync(next); }
+		catch (error) { if (isMissingPath(error)) return true; throw error; }
+		if (!entry.isSymbolicLink()) { current = next; continue; }
+		if (++hops > 40) return false;
+		const target = path.resolve(current, fs.readlinkSync(next));
+		if (!containsPath(root, target)) return false;
+		// Re-walk the link target from the root so links inside it are checked too.
+		pending.unshift(...path.relative(root, target).split(path.sep).filter(Boolean));
+		current = root;
+	}
+	return true;
 }
 
 function isMissingPath(error: unknown): boolean {
