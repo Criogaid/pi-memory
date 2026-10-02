@@ -2,7 +2,7 @@
  * No public pi fork API enforces this operation protocol and its read-before-write
  * contract, so this module owns the small turn loop and cancellation boundary.
  */
-import { getSupportedThinkingLevels, uuidv7, type Api, type Message, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
+import { clampThinkingLevel, getSupportedThinkingLevels, uuidv7, type Api, type Message, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { createReadTool, type ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -26,8 +26,10 @@ export interface MemoryJobRequest {
 	readonly systemPrompt: string;
 	readonly prompt: string;
 	readonly signal?: AbortSignal;
-	/** Configured job model; absent uses the session model and provider-default thinking. */
+	/** Configured job model; absent uses the session model and its thinking level. */
 	readonly model?: JobModelSelection;
+	/** The session's thinking level when the job starts; jobs without an explicit level follow it. */
+	readonly sessionThinkingLevel: ModelThinkingLevel;
 }
 
 export interface MemoryJobResult {
@@ -41,23 +43,28 @@ export interface MemoryJobResult {
 
 interface ResolvedJobModel {
 	readonly model: Model<Api> | undefined;
-	/** Absent sends no thinking options, so the provider applies its own default. */
-	readonly thinking?: ModelThinkingLevel;
+	readonly thinking: ModelThinkingLevel;
 	readonly notices: readonly string[];
 }
 
-/** An unusable selection falls back to the session model and reports why, so a typo cannot stop memory jobs. */
-export function resolveJobModel(ctx: ExtensionContext, selection: JobModelSelection | undefined): ResolvedJobModel {
-	if (!selection) return { model: ctx.model, notices: [] };
+/**
+ * Jobs request models the way pi's agent does, so whatever runs in the chat also runs here,
+ * including virtual models that only `streamSimple` routes. An unusable selection falls back
+ * to the session model and reports why, so a typo cannot stop memory jobs.
+ */
+function resolveJobModel(ctx: ExtensionContext, selection: JobModelSelection | undefined, sessionThinking: ModelThinkingLevel): ResolvedJobModel {
+	if (!selection) return { model: ctx.model, thinking: sessionThinking, notices: [] };
 	const configured = ctx.modelRegistry.find(selection.provider, selection.model);
 	if (!configured || !ctx.modelRegistry.hasConfiguredAuth(configured)) {
 		const reason = configured ? "has no configured credentials" : "is not a known model";
-		return { model: ctx.model, notices: [`Configured model ${formatJobModel(selection)} ${reason}; used the session model`] };
+		return { model: ctx.model, thinking: sessionThinking, notices: [`Configured model ${formatJobModel(selection)} ${reason}; used the session model`] };
 	}
-	if (selection.thinkingLevel === undefined) return { model: configured, notices: [] };
+	// pi clamps the session level to the session model; a different job model needs its own clamp.
+	const followed = clampThinkingLevel(configured, sessionThinking);
+	if (selection.thinkingLevel === undefined) return { model: configured, thinking: followed, notices: [] };
 	const level = getSupportedThinkingLevels(configured).find((candidate) => candidate === selection.thinkingLevel);
 	if (level === undefined) {
-		return { model: configured, notices: [`Thinking level ${selection.thinkingLevel} is not supported by ${configured.provider}/${configured.id}; used the provider default`] };
+		return { model: configured, thinking: followed, notices: [`Thinking level ${selection.thinkingLevel} is not supported by ${configured.provider}/${configured.id}; followed the session thinking level`] };
 	}
 	return { model: configured, thinking: level, notices: [] };
 }
@@ -77,7 +84,7 @@ export class MemoryJobs {
 		if (request.signal) signals.push(request.signal);
 		const signal = AbortSignal.any(signals);
 		const timeout = setTimeout(() => controller.abort(new Error("Memory job timed out")), TIMEOUT_MS);
-		const resolved = resolveJobModel(ctx, request.model);
+		const resolved = resolveJobModel(ctx, request.model, request.sessionThinkingLevel);
 		try {
 			return { ...await execute(ctx, request, signal, resolved), notices: resolved.notices };
 		} catch (error) {
@@ -109,15 +116,10 @@ async function execute(ctx: ExtensionContext, request: MemoryJobRequest, signal:
 		signal.throwIfAborted();
 		if (Buffer.byteLength(systemPrompt + JSON.stringify(messages), "utf8") > MAX_CONTEXT_BYTES)
 			throw new Error("Memory job context exceeds its bound; no further operations were applied");
-		const options = { signal, maxTokens: MAX_OUTPUT_TOKENS, sessionId: cacheSessionId };
-		// streamSimple turns thinking off when reasoning is absent, so only an explicit level uses it;
-		// otherwise the request carries no thinking options and the provider default applies.
 		// Pi's own agent maps "off" to an omitted reasoning option.
-		const response = await awaitWithAbort(thinking === undefined
-			? ctx.modelRegistry.complete(model, { systemPrompt, messages }, options)
-			: ctx.modelRegistry.streamSimple(model, { systemPrompt, messages }, {
-				...options, reasoning: thinking === "off" ? undefined : thinking,
-			}).result(), signal);
+		const response = await awaitWithAbort(ctx.modelRegistry.streamSimple(model, { systemPrompt, messages }, {
+			signal, maxTokens: MAX_OUTPUT_TOKENS, sessionId: cacheSessionId, reasoning: thinking === "off" ? undefined : thinking,
+		}).result(), signal);
 		signal.throwIfAborted();
 		if (response.stopReason === "error" || response.stopReason === "aborted")
 			throw new Error("Memory model did not complete its response");

@@ -50,6 +50,7 @@ const pi: any = {
 	setActiveTools: (names: string[]) => {
 		pi._activeTools = names;
 	},
+	getThinkingLevel: () => "off",
 	_activeTools: null as string[] | null,
 	_sent: null as string | null,
 };
@@ -86,10 +87,10 @@ function mkCtx(opts: { reply?: () => Promise<Partial<AssistantMessage>> } = {}) 
 		},
 		model: sessionModel,
 		getSystemPrompt: () => "",
-		modelRegistry: { complete: async (): Promise<AssistantMessage> => {
+		modelRegistry: { streamSimple: () => ({ result: async (): Promise<AssistantMessage> => {
 			if (!opts.reply) throw new Error("No model call expected");
 			return { ...assistantMessage(sessionModel, ""), ...await opts.reply() };
-		} },
+		} }) },
 		signal: undefined,
 		waitForIdle: async () => {},
 	};

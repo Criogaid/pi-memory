@@ -124,7 +124,7 @@ export async function showMemoryPanel(ctx: ExtensionContext, controls: {
 }
 
 const SESSION_MODEL_CHOICE = "Use the session model";
-const PROVIDER_DEFAULT_THINKING = "Provider default";
+const SESSION_THINKING_CHOICE = "Follow the session";
 const MAX_VISIBLE_MODELS = 10;
 
 function modelLabel(model: Model<Api>): string {
@@ -145,7 +145,7 @@ export async function chooseJobModel(ctx: ExtensionContext, key: JobModelKey): P
 		const update = () => {
 			const matches = fuzzyFilter([...models], input.getValue(), modelLabel);
 			list = new SelectList([
-				{ value: "session", label: SESSION_MODEL_CHOICE, description: "Follow the chat model and its provider defaults" },
+				{ value: "session", label: SESSION_MODEL_CHOICE, description: "Follow the chat model and its thinking level" },
 				...matches.map((candidate, index) => ({ value: String(index), label: candidate.id, description: `${candidate.provider} · ${candidate.name}` })),
 			], MAX_VISIBLE_MODELS, getSelectListTheme());
 			list.onSelect = (item) => done(item.value === "session" ? null : matches[Number(item.value)]);
@@ -170,7 +170,7 @@ export async function chooseJobModel(ctx: ExtensionContext, key: JobModelKey): P
 	});
 	if (model === null || model === undefined) return model;
 	const levels = getSupportedThinkingLevels(model);
-	const chosen = await ctx.ui.select(`Thinking level for ${model.provider}/${model.id}`, [PROVIDER_DEFAULT_THINKING, ...levels]);
+	const chosen = await ctx.ui.select(`Thinking level for ${model.provider}/${model.id}`, [SESSION_THINKING_CHOICE, ...levels]);
 	if (chosen === undefined) return undefined;
 	const thinkingLevel = levels.find((level) => level === chosen);
 	return { provider: model.provider, model: model.id, ...(thinkingLevel ? { thinkingLevel } : {}) };

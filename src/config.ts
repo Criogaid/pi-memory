@@ -60,7 +60,7 @@ export interface MemoryConfig {
 	dreamModel?: JobModelSelection;
 }
 
-/** A pi model registry reference. An absent thinking level keeps the provider default. */
+/** A pi model registry reference. An absent thinking level follows the session's thinking level. */
 export interface JobModelSelection {
 	readonly provider: string;
 	readonly model: string;

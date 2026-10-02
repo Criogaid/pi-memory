@@ -252,7 +252,7 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 		setStatus(ctx, "memory: extracting…");
 		try {
 			const result = await jobs.run(ctx, {
-				kind: "extract", paths, sessionId, prompt, model: config.extractModel,
+				kind: "extract", paths, sessionId, prompt, model: config.extractModel, sessionThinkingLevel: pi.getThinkingLevel(),
 				systemPrompt: (parentSystemPrompt ?? ctx.getSystemPrompt()) + "\n\n" + buildMemoryPromptSection(paths, config.citeMemories),
 			});
 			if (startedGeneration !== generation) return `extraction cancelled after session state changed; ${result.applied} operation(s) already applied`;
@@ -276,7 +276,7 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 		const startedGeneration = generation;
 		setStatus(ctx, "memory: consolidating…");
 		const result = await dream.run(ctx, {
-			automatic, paths, sessionId, model: config.dreamModel,
+			automatic, paths, sessionId, model: config.dreamModel, sessionThinkingLevel: pi.getThinkingLevel(),
 			systemPrompt: (parentSystemPrompt ?? ctx.getSystemPrompt()) + "\n\n" + buildMemoryPromptSection(paths, config.citeMemories),
 		});
 		if (startedGeneration !== generation) return automatic ? null : `Dream cancelled after session state changed; ${result.status === "skipped" ? 0 : result.applied} operation(s) already applied`;

@@ -10,7 +10,7 @@ import type { JobModelSelection, MemoryPaths } from "./config.js";
 import { buildDreamPrompt } from "./extract.js";
 import { isFileError, withStateLock } from "./persistence.js";
 import { writeFileSafe } from "./store.js";
-import { awaitWithAbort, MemoryJobs, type MemoryJobResult } from "./workflow.js";
+import { awaitWithAbort, MemoryJobs, type MemoryJobRequest, type MemoryJobResult } from "./workflow.js";
 
 // Keep README.md Behavior and guarantees aligned with these policy bounds.
 const MIN_INTERVAL_MS = 24 * 60 * 60_000;
@@ -54,6 +54,7 @@ export interface DreamRequest {
 	readonly sessionId: string;
 	readonly systemPrompt: string;
 	readonly model?: JobModelSelection;
+	readonly sessionThinkingLevel: MemoryJobRequest["sessionThinkingLevel"];
 }
 
 export class DreamRunner {
@@ -96,7 +97,7 @@ export class DreamRunner {
 				lockedSignal.throwIfAborted();
 				writeFileSafe(file, JSON.stringify(attempt) + "\n");
 				applied = await this.jobs.run(ctx, {
-					kind: "dream", paths: request.paths, sessionId: request.sessionId, systemPrompt: request.systemPrompt, model: request.model,
+					kind: "dream", paths: request.paths, sessionId: request.sessionId, systemPrompt: request.systemPrompt, model: request.model, sessionThinkingLevel: request.sessionThinkingLevel,
 					prompt: buildDreamPrompt(request.paths, excerpts.join("\n\n") + (omitted ? `\n${omitted} older sessions omitted from this bounded sample.` : "")), signal: lockedSignal,
 				});
 				lockedSignal.throwIfAborted();
