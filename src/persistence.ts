@@ -7,7 +7,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { lock } from "proper-lockfile";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
-import { projectConfigFile, type MemorySwitches } from "./config.js";
+import { projectConfigFile, type JobModelKey, type JobModelSelection, type MemorySwitches } from "./config.js";
 import { writeFileSafe } from "./store.js";
 
 export type LockedResult<T> = { readonly kind: "busy" } | { readonly kind: "done"; readonly value: T };
@@ -37,8 +37,17 @@ export function isFileError(error: unknown, code: string): boolean {
 	return error instanceof Error && "code" in error && error.code === code;
 }
 
-/** Preserve unknown configuration fields; malformed existing files are never overwritten. */
 export async function saveMemorySwitches(cwd: string, changes: Partial<MemorySwitches>): Promise<void> {
+	await saveProjectSettings(cwd, changes);
+}
+
+/** Null records an explicit return to the session model, overriding any global selection. */
+export async function saveJobModel(cwd: string, key: JobModelKey, selection: JobModelSelection | null): Promise<void> {
+	await saveProjectSettings(cwd, { [key]: selection });
+}
+
+/** Preserve unknown configuration fields; malformed existing files are never overwritten. */
+async function saveProjectSettings(cwd: string, changes: Readonly<Record<string, unknown>>): Promise<void> {
 	const file = projectConfigFile(cwd);
 	await withFileMutationQueue(file, async () => {
 		const result = await withStateLock(file, undefined, async (signal) => {

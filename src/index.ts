@@ -43,6 +43,7 @@ import {
 	loadConfig,
 	resolvePaths,
 	legacyMemoryDir,
+	type JobModelKey,
 	type MemoryConfig,
 	type MemoryPaths,
 	type MemorySwitches,
@@ -61,8 +62,8 @@ import { buildIndexSection, buildMemoryPromptSection, buildPinnedSection } from 
 import { RecallSession, recallForPrompt } from "./recall.js";
 import { MemoryJobs } from "./workflow.js";
 import { DreamRunner } from "./dream.js";
-import { saveMemorySwitches } from "./persistence.js";
-import { memoryPanelSummary, showMemoryPanel } from "./panel.js";
+import { saveJobModel, saveMemorySwitches } from "./persistence.js";
+import { chooseJobModel, memoryPanelSummary, showMemoryPanel } from "./panel.js";
 import {
 	ensureDirs,
 	formatIndexLine,
@@ -164,6 +165,17 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 		setStatus(ctx, statusText());
 		return true;
 	};
+	// A running job keeps the model it started with; the next job reads the new selection.
+	const changeJobModel = async (key: JobModelKey, ctx: ExtensionContext) => {
+		const selection = await chooseJobModel(ctx, key);
+		if (selection === undefined) return;
+		const currentConfig = config;
+		try { await saveJobModel(cwd, key, selection); }
+		catch (error) { ctx.ui.notify(`Memory settings were not saved: ${error instanceof Error ? error.message : String(error)}`, "warning"); return; }
+		if (currentConfig !== config) return;
+		if (selection === null) delete config[key];
+		else config[key] = selection;
+	};
 	const changePause = (value: boolean, ctx: ExtensionContext) => {
 		if (paused === value) return;
 		paused = value;
@@ -240,7 +252,7 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 		setStatus(ctx, "memory: extracting…");
 		try {
 			const result = await jobs.run(ctx, {
-				kind: "extract", paths, sessionId, prompt,
+				kind: "extract", paths, sessionId, prompt, model: config.extractModel,
 				systemPrompt: (parentSystemPrompt ?? ctx.getSystemPrompt()) + "\n\n" + buildMemoryPromptSection(paths, config.citeMemories),
 			});
 			if (startedGeneration !== generation) return `extraction cancelled after session state changed; ${result.applied} operation(s) already applied`;
@@ -250,7 +262,7 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 			}
 			if (result.status === "completed" || result.applied > 0)
 				pi.appendEntry("pi-memory:extracted", { lastExtractedId, written: result.written, status: result.status });
-			return `extraction ${result.status}: ${result.applied} operation(s)${result.errors.length ? `; ${result.errors.join("; ")}` : ""}`;
+			return `extraction ${result.status}: ${result.applied} operation(s)${formatIssues(result)}`;
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			return `extraction failed: ${message}`;
@@ -264,14 +276,14 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 		const startedGeneration = generation;
 		setStatus(ctx, "memory: consolidating…");
 		const result = await dream.run(ctx, {
-			automatic, paths, sessionId,
+			automatic, paths, sessionId, model: config.dreamModel,
 			systemPrompt: (parentSystemPrompt ?? ctx.getSystemPrompt()) + "\n\n" + buildMemoryPromptSection(paths, config.citeMemories),
 		});
 		if (startedGeneration !== generation) return automatic ? null : `Dream cancelled after session state changed; ${result.status === "skipped" ? 0 : result.applied} operation(s) already applied`;
 		setStatus(ctx, statusText());
 		if (result.status === "skipped") return null;
 		if (result.applied > 0) pi.appendEntry("pi-memory:dream", { written: result.written, status: result.status });
-		return `Dream ${result.status}: ${result.applied} operation(s)${result.errors.length ? `; ${result.errors.join("; ")}` : ""}`;
+		return `Dream ${result.status}: ${result.applied} operation(s)${formatIssues(result)}`;
 	};
 
 	const runManualDream = async (ctx: ExtensionCommandContext) => {
@@ -573,15 +585,17 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 				return;
 			}
 			if (argument) { ctx.ui.notify("Unknown memory setting. Use /memory to configure it, or select a command completion.", "warning"); return; }
-			const readState = () => ({ switches: config, paused, paths });
+			const readState = () => ({ switches: config, paused, paths, models: config });
 			if (ctx.mode !== "tui") { ctx.ui.notify(memoryPanelSummary(readState()), "info"); return; }
-			const action = await showMemoryPanel(ctx, {
+			let action;
+			// Model pickers replace the list temporarily; return to the panel so other settings stay one step away.
+			while ((action = await showMemoryPanel(ctx, {
 				read: readState,
 				change: async (key, value) => {
 					if (key === "paused") changePause(value, ctx);
 					else await changeSwitches({ [key]: value }, ctx);
 				},
-			});
+			}))?.startsWith("model:")) await changeJobModel(action.slice("model:".length) as JobModelKey, ctx);
 			switch (action) {
 				case "extract": ctx.ui.notify(await runExtraction(ctx, true), "info"); break;
 				case "dream": await runManualDream(ctx); break;
@@ -644,6 +658,11 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 			await runManualDream(ctx);
 		},
 	});
+}
+
+function formatIssues(result: { readonly errors: readonly string[]; readonly notices?: readonly string[] }): string {
+	const issues = [...(result.notices ?? []), ...result.errors];
+	return issues.length ? `; ${issues.join("; ")}` : "";
 }
 
 /** m0354 Z8t(): any later line with non-heading prose kills the shortcut. */

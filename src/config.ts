@@ -54,6 +54,37 @@ export interface MemoryConfig {
 	recall: boolean;
 	/** Wrap cited sentences in <cc-memory> tags (Claude Code's citing experiment). */
 	citeMemories: boolean;
+	/** Model for background extraction; absent follows the session model. */
+	extractModel?: JobModelSelection;
+	/** Model for Dream; absent follows the session model. */
+	dreamModel?: JobModelSelection;
+}
+
+/** A pi model registry reference. An absent thinking level keeps the provider default. */
+export interface JobModelSelection {
+	readonly provider: string;
+	readonly model: string;
+	readonly thinkingLevel?: string;
+}
+
+export type JobModelKey = "extractModel" | "dreamModel";
+export const JOB_MODEL_SETTINGS = [
+	{ key: "extractModel", label: "Extraction model", description: "Model and thinking level for memory extraction. The chat model is unchanged." },
+	{ key: "dreamModel", label: "Dream model", description: "Model and thinking level for Dream consolidation. The chat model is unchanged." },
+] as const satisfies readonly { key: JobModelKey; label: string; description: string }[];
+
+export function formatJobModel(selection: JobModelSelection | undefined): string {
+	if (!selection) return "session model";
+	return `${selection.provider}/${selection.model}${selection.thinkingLevel ? ` (${selection.thinkingLevel})` : ""}`;
+}
+
+/** Invalid values return undefined so a malformed file entry is ignored like other settings. */
+function parseJobModel(value: unknown): JobModelSelection | undefined {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+	if (!("provider" in value) || typeof value.provider !== "string" || !value.provider.trim()) return undefined;
+	if (!("model" in value) || typeof value.model !== "string" || !value.model.trim()) return undefined;
+	const thinkingLevel = "thinkingLevel" in value && typeof value.thinkingLevel === "string" && value.thinkingLevel.trim() ? value.thinkingLevel.trim() : undefined;
+	return { provider: value.provider.trim(), model: value.model.trim(), ...(thinkingLevel ? { thinkingLevel } : {}) };
 }
 
 export type MemorySwitches = { [Key in keyof MemoryConfig as MemoryConfig[Key] extends boolean ? Key : never]: MemoryConfig[Key] };
@@ -148,6 +179,13 @@ export function loadConfig(cwd: string): MemoryConfig {
 				config.autoExtractMinMessages = Math.max(1, Math.floor(raw.autoExtractMinMessages));
 			if ("recall" in raw && typeof raw.recall === "boolean") config.recall = raw.recall;
 			if ("citeMemories" in raw && typeof raw.citeMemories === "boolean") config.citeMemories = raw.citeMemories;
+			// A project file may write null to return a globally configured job to the session model.
+			for (const { key } of JOB_MODEL_SETTINGS) {
+				if (!(key in raw)) continue;
+				const value: unknown = (raw as Record<string, unknown>)[key];
+				if (value === null) delete config[key];
+				else { const selection = parseJobModel(value); if (selection) config[key] = selection; }
+			}
 		} catch {
 			// missing or unparsable file: keep defaults
 		}

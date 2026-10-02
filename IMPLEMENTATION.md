@@ -140,3 +140,11 @@ Installed-host verification: Pi 0.99.1 loaded the extension through its real RPC
 Development dependencies are pinned to pi 0.99.1 (typebox 1.3.27, matching pi), and the runtime peer range is `>=0.99.1 <0.100`. The upgrade exists so memory jobs can pass a provider-neutral thinking level: pi 0.85's public `ModelRegistry` exposes only provider-specific `complete` options, while 0.99 adds `completeSimple`/`streamSimple` with `reasoning`. Pi 0.99's tool path normalization (`utils/paths.js` `normalizePath`/`resolvePath`) was compared with `resolveToolPath` and matches; the helper is still not exported.
 
 Verification: `npm run check` reports no business-code errors; one test-file type error remains (`test/regressions.test.ts` passes an `ExtensionContext` where 0.99 tool execution expects `ExtensionToolContext`) and is handed off with the test work. All 70 regressions and lifecycle acceptance pass at runtime on 0.99.1; `git diff --check` passes.
+
+## Background job model selection
+
+`extractModel` and `dreamModel` are optional `{ provider, model, thinkingLevel? }` selections in the existing settings files; `null` explicitly returns a job to the session model. `config.ts` owns parsing and shared labels, `persistence.ts` writes them through the existing queue/lock adapter, and `workflow.ts` resolves them through pi's `ModelRegistry.find`, `hasConfiguredAuth`, and `getSupportedThinkingLevels`. Jobs now call `ModelRegistry.streamSimple`, pi 0.99's provider-neutral entry point; without a configured thinking level it sends the same options as the previous `complete` call, and `off` maps to an omitted reasoning option as in pi's agent. Unusable selections fall back to the session model or provider default and are reported as job notices rather than failing memory work.
+
+The `/memory` panel adds two model rows. Activating one replaces the list with a search picker built from pi's `Input`, `SelectList`, and `fuzzyFilter`, following pi-codex-compaction's summary-model picker, then a thinking-level selection. The command reopens the panel afterwards. RPC/print summaries include the current selections.
+
+Verification: `npm run check` reports no business-code errors; the only remaining error is the test-file type error recorded in the dependency-upgrade section. Tests were not run for this milestone by request; test updates are handed off.

@@ -32,7 +32,7 @@ With `sharedMemory: true`, team memories live in `<project>/.pi/memory/`. The pe
 | --- | --- |
 | `memory_save` | Save one typed memory and update its index entry. |
 | `# <fact>` | Transform an interactive memory shortcut into a request to use `memory_save`. |
-| `/memory` | Open the persistent settings panel in the terminal; report state in RPC/print mode. |
+| `/memory` | Open the persistent settings panel in the terminal, including the extraction and Dream model pickers; report state in RPC/print mode. |
 | `/memory on` / `/memory off` | Persist the project enable switch. |
 | `/memory auto-extract on\|off` / `/memory auto-dream on\|off` | Persist the corresponding automatic-work switch. |
 | `/memory recall on\|off` | Enable or disable relevant-memory injection on new prompts. |
@@ -79,11 +79,13 @@ Read from `~/.pi/agent/memory/config.json`, then `<project>/.pi/memory.json`. `P
   "autoExtract": true,
   "autoExtractMinMessages": 1,
   "recall": true,
-  "citeMemories": false
+  "citeMemories": false,
+  "extractModel": { "provider": "openai", "model": "gpt-mini", "thinkingLevel": "low" },
+  "dreamModel": null
 }
 ```
 
-The defaults and switch metadata live in [`config.ts`](src/config.ts). Panel and command changes to all six boolean switches are written to the project's `.pi/memory.json` and restored on session start. Unknown configuration fields are preserved; invalid existing files are not overwritten. Other running Pi instances load saved changes on their next session start. Pause remains local to the selected session branch. `citeMemories` adds the reference's `<cc-memory>` citation instruction. `PI_MEMORY_DEBUG=1` enables local debug messages.
+The defaults and switch metadata live in [`config.ts`](src/config.ts). Panel and command changes to all six boolean switches are written to the project's `.pi/memory.json` and restored on session start. Unknown configuration fields are preserved; invalid existing files are not overwritten. Other running Pi instances load saved changes on their next session start. Pause remains local to the selected session branch. `citeMemories` adds the reference's `<cc-memory>` citation instruction. `extractModel` and `dreamModel` choose a pi model registry entry and optional thinking level for each background job; omit them or set `null` to follow the session model (a project `null` also overrides a global selection). An omitted thinking level keeps the provider default. The panel pickers list authenticated models and save the choice to the project file. If a configured model is unknown or lacks credentials, the job uses the session model; an unsupported thinking level uses the provider default. Either fallback is reported with the job result. A running job keeps the model it started with. `PI_MEMORY_DEBUG=1` enables local debug messages.
 
 ## Reference parity
 

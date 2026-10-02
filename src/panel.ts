@@ -2,9 +2,13 @@
  * and dialog lifetime. This adapter keeps the dialog open and rolls displayed
  * values back after a failed save; settings persistence remains in persistence.ts.
  */
-import { getSettingsListTheme, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Container, SettingsList, Text, type SettingItem } from "@earendil-works/pi-tui";
-import { MEMORY_SWITCHES, type MemoryPaths, type MemorySwitches, type MemorySwitchKey } from "./config.js";
+import { getSupportedThinkingLevels, type Api, type Model } from "@earendil-works/pi-ai";
+import { getSelectListTheme, getSettingsListTheme, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Container, fuzzyFilter, Input, SelectList, SettingsList, Text, type SettingItem } from "@earendil-works/pi-tui";
+import {
+	formatJobModel, JOB_MODEL_SETTINGS, MEMORY_SWITCHES,
+	type JobModelKey, type JobModelSelection, type MemoryConfig, type MemoryPaths, type MemorySwitches, type MemorySwitchKey,
+} from "./config.js";
 import { readDreamState } from "./dream.js";
 import { indexPath, listMemories, readIndex } from "./store.js";
 
@@ -12,6 +16,7 @@ export interface MemoryPanelState {
 	readonly switches: Readonly<MemorySwitches>;
 	readonly paused: boolean;
 	readonly paths: MemoryPaths;
+	readonly models: Readonly<Pick<MemoryConfig, JobModelKey>>;
 }
 
 const ACTIONS = [
@@ -20,7 +25,8 @@ const ACTIONS = [
 	{ id: "personal-folder", label: "Open memory folder" },
 	{ id: "team-folder", label: "Open team memory folder" },
 ] as const;
-type PanelAction = typeof ACTIONS[number]["id"];
+/** Choosing a model closes the list for the picker; the command reopens the panel afterwards. */
+type PanelAction = typeof ACTIONS[number]["id"] | `model:${JobModelKey}`;
 const MAX_VISIBLE_SETTINGS = 12;
 
 export function memoryPanelSummary(state: MemoryPanelState, detail: "full" | "compact" = "full"): string {
@@ -39,6 +45,7 @@ export function memoryPanelSummary(state: MemoryPanelState, detail: "full" | "co
 		`Memories: ${memories.length} file(s), ${memories.filter((memory) => memory.pinned).length} pinned`,
 		`Last successful Dream: ${lastDream}`,
 		...(detail === "full" ? MEMORY_SWITCHES.map((setting) => `${setting.label}: ${state.switches[setting.key] ? "on" : "off"}`) : []),
+		...(detail === "full" ? JOB_MODEL_SETTINGS.map((setting) => `${setting.label}: ${formatJobModel(state.models[setting.key])}`) : []),
 	].join("\n");
 }
 
@@ -54,14 +61,20 @@ export async function showMemoryPanel(ctx: ExtensionContext, controls: {
 			currentValue: initial.switches[setting.key] ? "on" : "off", values: ["on", "off"],
 		}));
 		switches.splice(1, 0, { id: "paused", label: "Pause this branch", description: "Temporary pause for this conversation branch. It does not change project settings.", currentValue: initial.paused ? "on" : "off", values: ["on", "off"] });
-		const items: SettingItem[] = [...switches, ...ACTIONS.map((action) => ({ ...action, currentValue: "run", values: ["run"] }))];
+		const models: SettingItem[] = JOB_MODEL_SETTINGS.map((setting) => ({
+			id: setting.key, label: setting.label, description: setting.description,
+			currentValue: formatJobModel(initial.models[setting.key]), values: ["change"],
+		}));
+		const items: SettingItem[] = [...switches, ...models, ...ACTIONS.map((action) => ({ ...action, currentValue: "run", values: ["run"] }))];
 		const header = new Text("", 1, 1);
 		const container = new Container();
 		const refresh = () => {
 			const state = controls.read();
 			for (const setting of MEMORY_SWITCHES) list.updateValue(setting.key, state.switches[setting.key] ? "on" : "off");
 			list.updateValue("paused", state.paused ? "on" : "off");
+			for (const setting of JOB_MODEL_SETTINGS) list.updateValue(setting.key, formatJobModel(state.models[setting.key]));
 			for (const item of items) {
+				if (JOB_MODEL_SETTINGS.some((setting) => setting.key === item.id)) { item.values = pending ? undefined : ["change"]; continue; }
 				const action = ACTIONS.find((candidate) => candidate.id === item.id);
 				const available = action?.id === "team-folder" ? state.paths.teamDir !== null
 					: action?.id === "extract" || action?.id === "dream" ? state.switches.enabled && !state.paused : true;
@@ -89,6 +102,8 @@ export async function showMemoryPanel(ctx: ExtensionContext, controls: {
 			if (pending) return;
 			const setting = MEMORY_SWITCHES.find((candidate) => candidate.key === id);
 			if (setting || id === "paused") { void apply(setting?.key ?? "paused", value === "on"); return; }
+			const model = JOB_MODEL_SETTINGS.find((candidate) => candidate.key === id);
+			if (model) { done(`model:${model.key}`); return; }
 			const action = ACTIONS.find((candidate) => candidate.id === id);
 			if (action) done(action.id);
 		}, () => {
@@ -106,4 +121,57 @@ export async function showMemoryPanel(ctx: ExtensionContext, controls: {
 			dispose: () => { disposed = true; },
 		};
 	});
+}
+
+const SESSION_MODEL_CHOICE = "Use the session model";
+const PROVIDER_DEFAULT_THINKING = "Provider default";
+const MAX_VISIBLE_MODELS = 10;
+
+function modelLabel(model: Model<Api>): string {
+	return `${model.provider}/${model.id} (${model.name})`;
+}
+
+/**
+ * Pick a job model with pi's search widgets, mirroring pi-codex-compaction's summary-model picker.
+ * Null means the session model; undefined means the user cancelled without changing anything.
+ */
+export async function chooseJobModel(ctx: ExtensionContext, key: JobModelKey): Promise<JobModelSelection | null | undefined> {
+	const label = JOB_MODEL_SETTINGS.find((setting) => setting.key === key)?.label ?? key;
+	const models = [...ctx.modelRegistry.getAvailable()].sort((left, right) => modelLabel(left).localeCompare(modelLabel(right), "en"));
+	const model = await ctx.ui.custom<Model<Api> | null | undefined>((tui, _theme, keys, done) => {
+		const input = new Input();
+		const container = new Container();
+		let list: SelectList;
+		const update = () => {
+			const matches = fuzzyFilter([...models], input.getValue(), modelLabel);
+			list = new SelectList([
+				{ value: "session", label: SESSION_MODEL_CHOICE, description: "Follow the chat model and its provider defaults" },
+				...matches.map((candidate, index) => ({ value: String(index), label: candidate.id, description: `${candidate.provider} · ${candidate.name}` })),
+			], MAX_VISIBLE_MODELS, getSelectListTheme());
+			list.onSelect = (item) => done(item.value === "session" ? null : matches[Number(item.value)]);
+			list.onCancel = () => done(undefined);
+			container.clear();
+			container.addChild(new Text(`${label}: type to search authenticated models by provider, ID, or name`, 0, 0));
+			container.addChild(input);
+			container.addChild(list);
+		};
+		update();
+		return {
+			get focused() { return input.focused; },
+			set focused(value: boolean) { input.focused = value; },
+			render: (width) => container.render(width),
+			invalidate: () => container.invalidate(),
+			handleInput(data) {
+				if ((["tui.select.up", "tui.select.down", "tui.select.confirm", "tui.select.cancel"] as const).some((action) => keys.matches(data, action))) list.handleInput(data);
+				else { input.handleInput(data); update(); }
+				tui.requestRender();
+			},
+		};
+	});
+	if (model === null || model === undefined) return model;
+	const levels = getSupportedThinkingLevels(model);
+	const chosen = await ctx.ui.select(`Thinking level for ${model.provider}/${model.id}`, [PROVIDER_DEFAULT_THINKING, ...levels]);
+	if (chosen === undefined) return undefined;
+	const thinkingLevel = levels.find((level) => level === chosen);
+	return { provider: model.provider, model: model.id, ...(thinkingLevel ? { thinkingLevel } : {}) };
 }

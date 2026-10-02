@@ -6,7 +6,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { SessionManager, convertToLlm, serializeConversation, sessionEntryToContextMessages, truncateTail, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { MemoryPaths } from "./config.js";
+import type { JobModelSelection, MemoryPaths } from "./config.js";
 import { buildDreamPrompt } from "./extract.js";
 import { isFileError, withStateLock } from "./persistence.js";
 import { writeFileSafe } from "./store.js";
@@ -53,6 +53,7 @@ export interface DreamRequest {
 	readonly paths: MemoryPaths;
 	readonly sessionId: string;
 	readonly systemPrompt: string;
+	readonly model?: JobModelSelection;
 }
 
 export class DreamRunner {
@@ -95,7 +96,7 @@ export class DreamRunner {
 				lockedSignal.throwIfAborted();
 				writeFileSafe(file, JSON.stringify(attempt) + "\n");
 				applied = await this.jobs.run(ctx, {
-					kind: "dream", paths: request.paths, sessionId: request.sessionId, systemPrompt: request.systemPrompt,
+					kind: "dream", paths: request.paths, sessionId: request.sessionId, systemPrompt: request.systemPrompt, model: request.model,
 					prompt: buildDreamPrompt(request.paths, excerpts.join("\n\n") + (omitted ? `\n${omitted} older sessions omitted from this bounded sample.` : "")), signal: lockedSignal,
 				});
 				lockedSignal.throwIfAborted();
@@ -113,6 +114,7 @@ export class DreamRunner {
 				status: applied?.applied ? "partial" : signal.aborted ? "cancelled" : "failed",
 				written: applied?.written ?? [], applied: applied?.applied ?? 0,
 				errors: [...(applied?.errors ?? []), error instanceof Error ? error.message : String(error)],
+				notices: applied?.notices,
 			};
 		} finally {
 			clearTimeout(timer);
