@@ -169,7 +169,7 @@ export function buildMemoryPromptSection(paths: MemoryPaths, citeMemories: boole
 		parts.push(
 			"## Citing memories",
 			"",
-			"Whenever you use or cite content from a memory in communication with the user, always wrap the entire sentence in <cc-memory filenames=\"{comma separated list of memory file names}\">{sentence that references 1 or more memories}</cc-memory> tags. For example: <cc-memory filenames=\"testing-scripts.md\">From a previously saved memory, I see that the command to run tests in this project is `bun test`</cc-memory>",
+			"Whenever you use or cite content from a memory in communication with the user, always wrap the entire sentence in <cc-memory filenames=\"{comma separated list of memory file names}\">{sentence that references 1 or more memories}</cc-memory> tags. For example: <cc-memory filenames=\"testing-scripts.md\">From a previously saved memory, I see that the command to run tests in this project is `npm test`</cc-memory>",
 			"",
 			"Only do this in your reply text to the user — never inside tool inputs such as plans, todo items, or question options.",
 			"",

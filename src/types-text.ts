@@ -1,8 +1,8 @@
 /**
  * Memory-type prompt blocks, extracted VERBATIM from Claude Code v2.1.252
  * (m0169): mLe — the two-directory files-mode variant with <scope> tags;
- * Wyt — the variant without scope tags. Do not hand-edit; regenerate with
- * `bun .agent-tools/extract-memory-types.ts` from the workspace root.
+ * Wyt — the variant without scope tags. Keep these blocks aligned with the
+ * referenced source when changing the memory-type rules.
  */
 
 export const TYPES_WITH_SCOPE = [
