@@ -8,7 +8,6 @@
  * keeps the security boundary without the tool loop.
  */
 
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	LIMITS,
 	MEMORY_INDEX,
@@ -17,19 +16,13 @@ import {
 	type MemoryType,
 } from "./config.js";
 import {
-	deleteFileSafe,
-	indexPath,
 	listMemories,
-	readIndex,
-	readFileOrNull,
-	removeIndexLine,
-	upsertIndexLine,
-	writeFileSafe,
+	mutateMemory,
+	isValidFileRef,
 	formatIndexLine,
 } from "./store.js";
 import { serializeMemory } from "./frontmatter.js";
 
-const SAVE_TOOL = "memory_save";
 const DREAM_HEADER = "# Dream: Memory Consolidation";
 
 export interface ExtractionGateResult {
@@ -74,7 +67,9 @@ export function collectEntriesSince(
 ): { views: EntryView[]; lastEntryId: string | null } {
 	const views: EntryView[] = [];
 	let lastEntryId: string | null = sinceEntryId;
-	let collecting = sinceEntryId === null;
+	// Compaction or branch navigation may remove the cursor from the visible history.
+	let collecting = sinceEntryId === null || !branchEntries.some((entry) =>
+		typeof entry === "object" && entry !== null && "id" in entry && entry.id === sinceEntryId);
 	for (const entry of branchEntries as Array<Record<string, unknown>>) {
 		const id = typeof entry?.id === "string" ? entry.id : null;
 		if (!collecting) {
@@ -152,16 +147,6 @@ export interface ExtractOpDelete {
 }
 export type ExtractOp = ExtractOpUpsert | ExtractOpDelete;
 
-const WINDOWS_RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
-
-function isValidFileRef(ref: string, hasTeam: boolean): boolean {
-	if (!ref.endsWith(".md")) return false;
-	if (ref.includes("..") || ref.includes("\\") || ref.split("/").some((s) => s.startsWith("."))) return false;
-	// Windows reserved device names (con.md, aux.md, ...) break file I/O.
-	if (ref.split("/").some((s) => WINDOWS_RESERVED.test(s.replace(/\.md$/i, "")))) return false;
-	if (ref.startsWith("team/")) return hasTeam && /^[a-z0-9][a-z0-9_\/\-]*\.md$/.test(ref);
-	return /^[a-z0-9][a-z0-9_-]*\.md$/.test(ref);
-}
 
 /**
  * Port of Claude Code's qF(): normalize memory content before it hits disk —
@@ -189,14 +174,13 @@ export interface ApplyResult {
 	written: string[];
 }
 
-/** Apply extraction ops with the same guards Claude Code enforces (caps, pins, index discipline). */
-export function applyExtractOps(paths: MemoryPaths, ops: unknown, sessionId: string, currentPinned: number): ApplyResult {
+/** Apply the plugin's validated operation protocol through the shared mutation owner. */
+export async function applyExtractOps(paths: MemoryPaths, ops: unknown, sessionId: string): Promise<ApplyResult> {
 	const result: ApplyResult = { applied: 0, skipped: [], written: [] };
 	if (!Array.isArray(ops)) {
 		result.skipped.push("response was not a JSON object with an ops array");
 		return result;
 	}
-	let pinnedCount = currentPinned;
 	for (const raw of ops.slice(0, LIMITS.extractMaxOps)) {
 		const op = raw as Record<string, unknown>;
 		const file = typeof op?.file === "string" ? op.file : "";
@@ -205,14 +189,9 @@ export function applyExtractOps(paths: MemoryPaths, ops: unknown, sessionId: str
 			continue;
 		}
 		if (op?.op === "delete") {
-			const abs = file.startsWith("team/")
-				? paths.teamDir + file.slice("team/".length - 1)
-				: paths.personalDir + "/" + file;
-			if (deleteFileSafe(abs)) {
-				removeIndexLine(paths, file);
-				result.applied++;
-				result.written.push(`deleted ${file}`);
-			}
+			const deleted = await mutateMemory(paths, { kind: "delete", ref: file });
+			if (deleted.ok) { result.applied++; result.written.push(`deleted ${file}`); }
+			else result.skipped.push(`${file}: ${deleted.error}`);
 			continue;
 		}
 		if (op?.op !== "upsert") {
@@ -243,14 +222,7 @@ export function applyExtractOps(paths: MemoryPaths, ops: unknown, sessionId: str
 			continue;
 		}
 		const pinned = op.pinned === true;
-		if (pinned && pinnedCount >= LIMITS.maxPinned) {
-			result.skipped.push(`${file}: pinned memory limit (${LIMITS.maxPinned}) reached`);
-			continue;
-		}
 		const name = file.replace(/\.md$/, "");
-		const abs = file.startsWith("team/")
-			? paths.teamDir + file.slice("team/".length - 1)
-			: paths.personalDir + "/" + file;
 		const content = serializeMemory(
 			{
 				name,
@@ -262,13 +234,11 @@ export function applyExtractOps(paths: MemoryPaths, ops: unknown, sessionId: str
 			},
 			body,
 		);
-		writeFileSafe(abs, content);
-		if (pinned) pinnedCount++;
 		const indexLine =
 			typeof op.indexLine === "string" && op.indexLine.trim()
 				? flattenIndexLine(normalizeContent(op.indexLine))
 				: formatIndexLine(file, name, description);
-		const indexResult = upsertIndexLine(paths, file, indexLine);
+		const indexResult = await mutateMemory(paths, { kind: "upsert", ref: file, content, indexLine });
 		if (!indexResult.ok) {
 			result.skipped.push(`${file}: ${indexResult.error}`);
 			continue;

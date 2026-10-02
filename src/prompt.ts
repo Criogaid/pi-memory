@@ -12,7 +12,7 @@
 
 import { LIMITS, MEMORY_INDEX, type MemoryPaths } from "./config.js";
 import { TYPES_WITH_SCOPE, TYPES_WITHOUT_SCOPE } from "./types-text.js";
-import { listMemories, truncateIndex, type MemoryFileInfo } from "./store.js";
+import { truncateIndex, type MemoryFileInfo } from "./store.js";
 
 const SAVE_TOOL = "memory_save";
 
@@ -76,7 +76,6 @@ const BOUNDARY_TEXT = [
 ].join("\n");
 
 export function buildMemoryPromptSection(paths: MemoryPaths, citeMemories: boolean): string {
-	const memories = listMemories(paths);
 	const parts: string[] = [];
 
 	parts.push(

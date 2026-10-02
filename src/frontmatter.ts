@@ -32,7 +32,7 @@ export function parseMemory(raw: string): ParsedMemory {
 		// Prefer pi's strict YAML frontmatter parser; fall back to the lenient
 		// line scanner for hand-edited files it would reject.
 		try {
-			const { frontmatter: data, body } = parseFrontmatter<Record<string, unknown>>(raw);
+			const { frontmatter: data } = parseFrontmatter<Record<string, unknown>>(raw);
 			const metadata = (data.metadata ?? {}) as Record<string, unknown>;
 			const type = String(metadata.type ?? "") as MemoryType;
 			return {

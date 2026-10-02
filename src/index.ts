@@ -40,6 +40,7 @@ import {
 	LIMITS,
 	loadConfig,
 	resolvePaths,
+	legacyMemoryDir,
 	type MemoryConfig,
 	type MemoryPaths,
 } from "./config.js";
@@ -60,14 +61,15 @@ import { buildIndexSection, buildMemoryPromptSection, buildPinnedSection } from 
 import { RecallSession, recallForPrompt } from "./recall.js";
 import {
 	ensureDirs,
-	deleteFileSafe,
 	formatIndexLine,
 	indexPath,
 	listMemories,
 	readFileOrNull,
 	readIndex,
-	removeIndexLine,
-	upsertIndexLine,
+	mutateMemory,
+	resolveToolPath,
+	isInsideMemory,
+	isValidFileRef,
 	writeFileSafe,
 } from "./store.js";
 
@@ -124,8 +126,8 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 		delete (globalThis as Record<string, unknown>)[guardKey];
 	});
 
-	const cwd = process.cwd();
-	const config: MemoryConfig = loadConfig(cwd);
+	let cwd = process.cwd();
+	let config: MemoryConfig = loadConfig(cwd);
 	let paths: MemoryPaths = resolvePaths(cwd, config);
 
 	let paused = false;
@@ -174,7 +176,7 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 
 	/** Run the gated extraction flow; returns a human-readable result line. */
 	const runExtraction = async (ctx: RunCtx, force: boolean): Promise<string> => {
-		if (paused && !force) return PAUSED_MESSAGE;
+		if (!enabled || paused) return paused ? PAUSED_MESSAGE : "Memory is disabled for this session.";
 		const branch = activeEntries(ctx) as EntryLike[];
 		const { views, lastEntryId } = collectEntriesSince(branch, lastExtractedId);
 		const recent = views.length > 0 ? views : force ? collectEntriesSince(branch, null).views.slice(-10) : [];
@@ -190,6 +192,7 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 			if (gate.advanceCursor && lastEntryId && lastEntryId !== lastExtractedId) {
 				lastExtractedId = lastEntryId;
 				pi.appendEntry("pi-memory:extraction-cursor", { lastExtractedId });
+				directWriteSinceExtract = false;
 			}
 			return `skipped: ${gate.reason}`;
 		}
@@ -218,9 +221,7 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 				.join("\n");
 			const parsed = parseExtractResponse(text);
 			if (!parsed) return "extraction produced no parsable ops";
-			const result = await withFileMutationQueue(indexPath(paths), async () =>
-				applyExtractOps(paths, parsed.ops, sessionId, listMemories(paths).filter((m) => m.pinned).length),
-			);
+			const result = await applyExtractOps(paths, parsed.ops, sessionId);
 			lastExtractedId = lastEntryId ?? lastExtractedId;
 			directWriteSinceExtract = false;
 			pi.appendEntry("pi-memory:extracted", { lastExtractedId, written: result.written });
@@ -240,9 +241,14 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
-		Object.assign(config, loadConfig(cwd));
+		cwd = ctx.cwd;
+		config = loadConfig(cwd);
 		paths = resolvePaths(cwd, config);
 		ensureDirs(paths);
+		const legacy = legacyMemoryDir(cwd, paths);
+		if (listMemories({ ...paths, personalDir: legacy, teamDir: null }).length > 0) {
+			ctx.ui.notify(`Legacy memories remain at ${legacy}. Use /memory import-legacy to copy them into this project's isolated directory.`, "info");
+		}
 		recallSession.reset();
 		paused = false;
 		lastExtractedId = null;
@@ -317,7 +323,7 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 		if (!enabled) return;
 		setStatus(ctx, statusText());
 
-		if (config.recall && !paused && event.prompt.trim()) {
+		if (config.recall && !paused && event.prompt.trim() && !isDreamPrompt(event.prompt)) {
 			const result = recallForPrompt(paths, event.prompt, recallSession, config.citeMemories);
 			if (result.reminder) {
 				recallSession.mark(result.refs, result.bytes);
@@ -370,7 +376,7 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 	const PAUSED_WRITE_MESSAGE = "Cannot write to memory while it is paused. Run /pause-memory to resume automemory.";
 	const PAUSED_READ_MESSAGE = "Cannot read memory while it is paused. Run /pause-memory to resume automemory.";
 
-	pi.on("tool_call", async (event) => {
+	pi.on("tool_call", async (event, ctx) => {
 		if (!enabled) return;
 		if (!MEMORY_TOOLS.has(event.toolName)) return;
 		if (event.toolName === "memory_save") {
@@ -379,17 +385,18 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 		}
 		const target = (event.input as { path?: unknown } | undefined)?.path;
 		if (typeof target !== "string") return;
-		if (!isInsideMemory(target, paths)) return;
+		if (!isInsideMemory(target, paths, ctx.cwd)) return;
 		if (paused) {
 			return { block: true, reason: event.toolName === "read" ? PAUSED_READ_MESSAGE : PAUSED_WRITE_MESSAGE };
 		}
 	});
 
-	pi.on("tool_result", async (event) => {
-		if (!enabled) return;
+	pi.on("tool_result", async (event, ctx) => {
+		if (!enabled || paused || event.isError) return;
 		if (event.toolName !== "write" && event.toolName !== "edit") return;
 		const target = (event.input as { path?: unknown } | undefined)?.path;
-		if (typeof target !== "string" || !isInsideMemory(target, paths)) return;
+		if (typeof target !== "string" || !isInsideMemory(target, paths, ctx.cwd)) return;
+		const absolute = resolveToolPath(target, ctx.cwd);
 		// rUn counts any Write/Edit inside the memory dir as a direct write
 		// (no extension filter); HD's stamp itself only touches .md files.
 		directWriteSinceExtract = true;
@@ -398,12 +405,12 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 		// add originSessionId/modified when missing, refresh modified otherwise.
 		// Routed through the same mutation queue as memory_save so a parallel
 		// save of the same file cannot interleave with the stamp write.
-		await withFileMutationQueue(indexPath(paths), async () => {
-			const raw = readFileOrNull(target);
+		await withFileMutationQueue(absolute, async () => {
+			const raw = readFileOrNull(absolute);
 			if (raw !== null) {
 				const stamped = stampProvenance(raw, sessionId);
 				if (stamped !== raw) {
-					writeFileSafe(target, stamped);
+					writeFileSafe(absolute, stamped);
 					debug("stamped provenance:", target);
 				}
 			}
@@ -516,38 +523,16 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 			if (containsSecret(`${file}\n${description}\n${body}`)) {
 				return toolError("content contains potential secrets and cannot be written to memory");
 			}
-			if (params.pinned) {
-				// Re-saving an already-pinned file must not trip the limit —
-				// only a net-new pinned memory counts against the cap.
-				const pinnedCount = listMemories(paths).filter((m) => m.pinned && m.ref !== (team ? `team/${file}` : file)).length;
-				if (pinnedCount >= LIMITS.maxPinned) {
-					return toolError(`pinned memory limit (${LIMITS.maxPinned}) reached — unpin one first`);
-				}
-			}
 			const ref = team ? `team/${file}` : file;
-			const abs = team ? `${paths.teamDir}/${file}` : `${paths.personalDir}/${file}`;
 			const content = serializeMemory(
 				{ name, description, type: params.type, pinned: params.pinned === true, originSessionId: sessionId, modified: new Date().toISOString() },
 				body,
 			);
-			// Serialize memory writes through pi's per-file mutation queue: the
-			// memory file and the shared MEMORY.md index must not interleave
-			// with parallel write/edit calls in the same assistant turn.
-			const saved = await withFileMutationQueue(indexPath(paths), async () => {
-				const existedBefore = readFileOrNull(abs) !== null;
-				writeFileSafe(abs, content);
-				const indexLine = params.indexLine?.trim()
-					? flattenIndexLine(normalizeContent(params.indexLine))
-					: formatIndexLine(ref, name, description);
-				const indexResult = upsertIndexLine(paths, ref, indexLine);
-				if (!indexResult.ok) {
-					// Roll back a first-time write so no orphan memory lingers outside the index.
-					if (!existedBefore) deleteFileSafe(abs);
-					return { ok: false as const, error: indexResult.error };
-				}
-				return { ok: true as const };
+			const saved = await mutateMemory(paths, {
+				kind: "upsert", ref, content,
+				indexLine: params.indexLine?.trim() ? flattenIndexLine(normalizeContent(params.indexLine)) : formatIndexLine(ref, name, description),
 			});
-			if (!saved.ok) return toolError(saved.error ?? "index update failed");
+			if (!saved.ok) return toolError(saved.error);
 			directWriteSinceExtract = true;
 			setStatus(ctx, statusText());
 			return {
@@ -564,7 +549,22 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 
 	pi.registerCommand("memory", {
 		description: "Open the pi-memory panel (stats, pause, extract, dream)",
-		handler: async (_args, ctx) => {
+		handler: async (args, ctx) => {
+			if (args.trim() === "import-legacy") {
+				if (!enabled || paused) { ctx.ui.notify(paused ? PAUSED_MESSAGE : "Memory is disabled for this session.", "warning"); return; }
+				const legacy = legacyMemoryDir(cwd, paths);
+				const files = listMemories({ ...paths, personalDir: legacy, teamDir: null });
+				let imported = 0;
+				for (const file of files) {
+					const content = readFileOrNull(file.absolutePath);
+					if (content === null || !isValidFileRef(file.ref, false)) continue;
+					const result = await mutateMemory(paths, { kind: "upsert", ref: file.ref, content }, new Map([[file.ref, null]]));
+					if (result.ok) imported++;
+				}
+				ctx.ui.notify(`Imported ${imported} of ${files.length} legacy memories. Existing targets and all legacy files were preserved.`, "info");
+				snapshotMemoryPrompt();
+				return;
+			}
 			const memories = listMemories(paths);
 			const index = readIndex(paths);
 			const summary = [
@@ -597,6 +597,7 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 			switch (choice) {
 				case `Toggle pause (${paused ? "resume" : "pause"} memory for this session)`:
 					paused = !paused;
+					pi.appendEntry("pi-memory:state", { paused });
 					ctx.ui.notify(
 						paused
 							? PAUSED_MESSAGE
@@ -608,6 +609,7 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 					ctx.ui.notify(await runExtraction(ctx as unknown as RunCtx, true), "info");
 					break;
 				case "Run a dream (memory consolidation)":
+					if (!enabled || paused) { ctx.ui.notify(paused ? PAUSED_MESSAGE : "Memory is disabled for this session.", "warning"); break; }
 					pi.sendUserMessage(buildDreamPrompt(paths, pathJoin(getAgentDir(), "sessions"), await dreamSessionList()));
 					break;
 				case "Toggle background auto-extract":
@@ -679,6 +681,7 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 			return filtered.length > 0 ? filtered : items.length > 0 ? items : null;
 		},
 		handler: async (args, ctx) => {
+			if (!enabled || paused) { ctx.ui.notify(paused ? PAUSED_MESSAGE : "Memory is disabled for this session.", "warning"); return; }
 			if (!paths.teamDir) {
 				ctx.ui.notify("Shared (team) memory is not enabled — set sharedMemory: true in .pi/memory.json first.", "warning");
 				return;
@@ -688,21 +691,8 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 				ctx.ui.notify("Usage: /remember <file.md> (a personal memory filename)", "warning");
 				return;
 			}
-			const source = `${paths.personalDir}/${ref}`;
-			const raw = readFileOrNull(source);
-			if (raw === null) {
-				ctx.ui.notify(`No personal memory named ${ref}.`, "warning");
-				return;
-			}
-			await withFileMutationQueue(indexPath(paths), async () => {
-				writeFileSafe(`${paths.teamDir}/${ref}`, raw);
-				deleteFileSafe(source);
-				// Drop the personal index line too — upserting the team/ line
-				// targets a different ref and would leave a stale pointer.
-				removeIndexLine(paths, ref);
-				const memory = listMemories(paths).find((m) => m.ref === `team/${ref}`);
-				upsertIndexLine(paths, `team/${ref}`, formatIndexLine(`team/${ref}`, memory?.name ?? ref.replace(/\.md$/, ""), memory?.description ?? ""));
-			});
+			const promoted = await mutateMemory(paths, { kind: "promote", ref });
+			if (!promoted.ok) { ctx.ui.notify(promoted.error, "warning"); return; }
 			ctx.ui.notify(`Promoted ${ref} to team memory (team/${ref}).`, "info");
 		},
 	});
@@ -710,8 +700,8 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 	pi.registerCommand("dream", {
 		description: "Run a memory-consolidation dream over your memory files",
 		handler: async (_args, ctx) => {
-			if (paused) {
-				ctx.ui.notify(PAUSED_MESSAGE, "warning");
+			if (!enabled || paused) {
+				ctx.ui.notify(paused ? PAUSED_MESSAGE : "Memory is disabled for this session.", "warning");
 				return;
 			}
 			await ctx.waitForIdle();
@@ -750,11 +740,6 @@ async function openFolder(
 	ctx.ui.notify(opened ? `Opened ${dir}` : `Folder: ${dir}`, "info");
 }
 
-function isInsideMemory(target: string, paths: MemoryPaths): boolean {
-	const normalized = target.replace(/\\/g, "/");
-	if (normalized.startsWith(paths.personalDir.replace(/\\/g, "/"))) return true;
-	return paths.teamDir !== null && normalized.startsWith(paths.teamDir.replace(/\\/g, "/"));
-}
 
 function toolError(message: string) {
 	return {

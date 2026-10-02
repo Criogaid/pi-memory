@@ -11,6 +11,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { createHash } from "node:crypto";
 
 export const MEMORY_INDEX = "MEMORY.md";
 
@@ -59,10 +60,21 @@ const DEFAULTS: MemoryConfig = {
 	citeMemories: false,
 };
 
-/** Claude Code's so(): slugify a project path for use as a directory name. */
+/** The full canonical path owns identity; the basename is only a readable prefix. */
 export function projectSlug(cwd: string): string {
-	const base = path.basename(cwd).replace(/[^a-zA-Z0-9\-_]/g, "-");
-	return base === "" ? "unknown" : base;
+	let canonical = path.resolve(cwd);
+	try { canonical = fs.realpathSync.native(canonical); } catch (error) {
+		if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+	}
+	if (process.platform === "win32") canonical = canonical.toLowerCase();
+	const maxLabelChars = 48;
+	const label = (path.basename(canonical).replace(/[^a-zA-Z0-9\-_]/g, "-") || "unknown").slice(0, maxLabelChars);
+	return `${label}-${createHash("sha256").update(canonical).digest("hex")}`;
+}
+
+/** Legacy directories may contain several projects' data, so migration is explicit. */
+export function legacyMemoryDir(cwd: string, paths: MemoryPaths): string {
+	return path.join(path.dirname(paths.personalDir), path.basename(cwd).replace(/[^a-zA-Z0-9\-_]/g, "-") || "unknown");
 }
 
 export interface MemoryPaths {
@@ -76,7 +88,7 @@ export function resolvePaths(cwd: string, config: MemoryConfig): MemoryPaths {
 	// without it a relative config would silently follow the process wherever
 	// it wanders. Trailing separators are normalized by resolve as well.
 	const root = config.memoryDir
-		? path.resolve(expandHome(config.memoryDir))
+		? path.resolve(cwd, expandHome(config.memoryDir))
 		: path.join(os.homedir(), ".pi", "agent", "memory");
 	return {
 		personalDir: path.join(root, projectSlug(cwd)),

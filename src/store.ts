@@ -1,6 +1,6 @@
 /**
  * Memory store operations: directory scan, MEMORY.md index read/truncate,
- * index line upsert/remove, and safe path resolution.
+ * transactional structured mutations, and safe path resolution.
  *
  * Truncation behavior is ported verbatim from Claude Code's Q5e() (m0169):
  * cap the index at 200 lines / 25000 bytes, fall back to the last newline,
@@ -10,6 +10,10 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
+import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
+import { expandHome } from "./config.js";
 import { LIMITS, MEMORY_INDEX, type MemoryPaths } from "./config.js";
 import { parseMemory } from "./frontmatter.js";
 
@@ -190,57 +194,162 @@ function indexLineTarget(line: string): string | null {
 	}
 	return lastAnchored ?? lastAny;
 }
-export function upsertIndexLine(paths: MemoryPaths, ref: string, line: string): { ok: boolean; error?: string } {
-	const file = indexPath(paths);
-	const raw = readFileOrNull(file) ?? "";
-	// Normalize: drop trailing empty split artifacts so repeated upserts don't
-	// accumulate blank lines against the 200-line cap; we re-add one final \n.
-	const lines = raw.split("\n");
+
+export type MemoryChange =
+	| { readonly kind: "upsert"; readonly ref: string; readonly content: string; readonly indexLine?: string }
+	| { readonly kind: "delete"; readonly ref: string }
+	| { readonly kind: "promote"; readonly ref: string };
+export type MutationResult = { readonly ok: true } | { readonly ok: false; readonly error: string };
+
+/** Match pi 0.85's tool path expansion at this boundary; its helper is not public. */
+export function resolveToolPath(target: string, cwd: string): string {
+	let normalized = target.replace(/[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g, " ").replace(/^@/, "");
+	if (process.platform === "win32" && !normalized.startsWith("//") && !normalized.includes("\\")) {
+		const drive = /^\/(?:mnt\/|cygdrive\/)?([a-z])(?:\/(.*))?$/i.exec(normalized);
+		if (drive) normalized = `${drive[1].toUpperCase()}:\\${drive[2]?.replaceAll("/", "\\") ?? ""}`;
+	}
+	if (normalized.startsWith("file://")) normalized = fileURLToPath(normalized);
+	else if (normalized === "~" || normalized.startsWith("~/") || (process.platform === "win32" && normalized.startsWith("~\\"))) normalized = expandHome(normalized);
+	return path.resolve(cwd, normalized);
+}
+
+function canonicalPath(target: string): string {
+	try { return fs.realpathSync.native(target); } catch (error) {
+		if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+		const parent = path.dirname(target);
+		return parent === target ? target : path.join(canonicalPath(parent), path.basename(target));
+	}
+}
+
+function containsPath(root: string, target: string): boolean {
+	const relative = path.relative(root, target);
+	return relative === "" || (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`));
+}
+
+/** Recognize aliases for pause checks, while writes separately reject escaping symlinks. */
+export function isInsideMemory(target: string, paths: MemoryPaths, cwd: string): boolean {
+	const absolute = resolveToolPath(target, cwd);
+	return [paths.personalDir, paths.teamDir].some((root) => root !== null &&
+		(containsPath(root, absolute) || containsPath(canonicalPath(root), canonicalPath(absolute))));
+}
+
+const RESERVED_FILE_NAME = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
+export function isValidFileRef(ref: string, hasTeam: boolean): boolean {
+	if (ref.startsWith("team/") && !hasTeam) return false;
+	const name = ref.replace(/^team\//, "");
+	const segments = name.split("/");
+	const file = segments.pop();
+	return file !== undefined && /^[a-z0-9][a-z0-9_-]*\.md$/.test(file) && file !== "memory.md"
+		&& !RESERVED_FILE_NAME.test(file.slice(0, -3))
+		&& segments.every((segment) => /^[a-z0-9][a-z0-9_-]*$/.test(segment) && !RESERVED_FILE_NAME.test(segment));
+}
+
+export function memoryPath(paths: MemoryPaths, ref: string): string {
+	if (!isValidFileRef(ref, paths.teamDir !== null)) throw new Error(`Invalid memory reference: ${ref}`);
+	const root = ref.startsWith("team/") ? paths.teamDir : paths.personalDir;
+	if (!root) throw new Error("Team memory is not enabled");
+	const target = path.join(root, ref.replace(/^team\//, ""));
+	if (!containsPath(canonicalPath(root), canonicalPath(target))) throw new Error(`Memory path escapes its directory: ${ref}`);
+	return target;
+}
+
+function readExisting(target: string): Buffer | null {
+	try { return fs.readFileSync(target); } catch (error) {
+		if (error instanceof Error && "code" in error && error.code === "ENOENT") return null;
+		throw error;
+	}
+}
+
+function changeIndex(raw: string, ref: string, line?: string): string {
+	const lines = raw.split(/\r?\n/).filter((entry) => indexLineTarget(entry) !== ref);
 	while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
-	const filtered = lines.filter((l) => indexLineTarget(l) !== ref);
-	filtered.push(line);
-	if (filtered.length > LIMITS.indexMaxLines) {
-		return { ok: false, error: `MEMORY.md index would exceed ${LIMITS.indexMaxLines} lines — merge or prune existing entries first.` };
-	}
-	const joined = filtered.join("\n");
-	if (joined.length > LIMITS.indexMaxBytes) {
-		return { ok: false, error: `MEMORY.md index would exceed ${LIMITS.indexMaxBytes} bytes — shorten the line or prune entries.` };
-	}
-	fs.mkdirSync(paths.personalDir, { recursive: true });
-	fs.writeFileSync(file, joined + "\n");
-	return { ok: true };
+	if (line !== undefined) lines.push(line);
+	return lines.length ? `${lines.join("\n")}\n` : "";
 }
 
-export function removeIndexLine(paths: MemoryPaths, ref: string): void {
-	const file = indexPath(paths);
-	const raw = readFileOrNull(file);
-	if (raw === null) return;
-	const kept = raw.split("\n").filter((l) => indexLineTarget(l) !== ref);
-	while (kept.length > 0 && kept[kept.length - 1] === "") kept.pop();
-	if (kept.length === 0) {
-		fs.writeFileSync(file, "");
-		return;
-	}
-	fs.writeFileSync(file, kept.join("\n") + "\n");
+async function withQueues<T>(files: readonly string[], run: () => T | Promise<T>): Promise<T> {
+	const [first, ...rest] = files;
+	return first === undefined ? run() : withFileMutationQueue(first, () => withQueues(rest, run));
 }
 
-export function writeFileSafe(absolutePath: string, content: string): void {
+/**
+ * Own memory/index invariants for every structured writer. Locks use sorted absolute
+ * paths (index plus affected files), so built-in edits share the file lock without cycles.
+ * Preflight runs inside serialization. Individual replacements are atomic; ordinary
+ * failures restore original bytes. A process/OS crash between renames is not a transaction.
+ */
+export async function mutateMemory(paths: MemoryPaths, change: MemoryChange, expected?: ReadonlyMap<string, string | null>): Promise<MutationResult> {
+	const source = memoryPath(paths, change.ref);
+	const targetRef = change.kind === "promote" ? `team/${change.ref}` : change.ref;
+	if (change.kind === "promote" && change.ref.startsWith("team/")) return { ok: false, error: "Only personal memories can be promoted" };
+	const target = memoryPath(paths, targetRef);
+	const index = indexPath(paths);
+	const keys = [...new Set([source, target, index])].sort();
+	return withQueues(keys, () => {
+		// Recheck after waiting: another tool may have replaced a path with a symlink.
+		memoryPath(paths, change.ref);
+		memoryPath(paths, targetRef);
+		if (!containsPath(canonicalPath(paths.personalDir), canonicalPath(index))) {
+			return { ok: false, error: "MEMORY.md resolves outside the personal memory directory" };
+		}
+		if (expected) for (const [ref, content] of expected) {
+			if ((readExisting(memoryPath(paths, ref))?.toString("utf8") ?? null) !== content) {
+				return { ok: false, error: `Memory changed after it was read: ${ref}; read again before retrying` };
+			}
+		}
+		const original = new Map(keys.map((file) => [file, readExisting(file)]));
+		const before = original.get(source);
+		let content: string;
+		let nextIndex = original.get(index)?.toString("utf8") ?? "";
+		if (change.kind === "delete") {
+			if (!before) return { ok: false, error: `No memory named ${change.ref}` };
+			content = "";
+			nextIndex = changeIndex(nextIndex, change.ref);
+		} else {
+			if (change.kind === "promote") {
+				if (!before) return { ok: false, error: `No personal memory named ${change.ref}` };
+				if (original.get(target) !== null) return { ok: false, error: `Team memory already exists: ${targetRef}; merge or rename it before promotion` };
+				content = before.toString("utf8");
+				nextIndex = changeIndex(nextIndex, change.ref);
+			} else content = change.content;
+			const memory = parseMemory(content);
+			const pinned = listMemories(paths).filter((item) => item.pinned && item.ref !== change.ref && item.ref !== targetRef).length;
+			if (memory.frontmatter.pinned && pinned >= LIMITS.maxPinned) return { ok: false, error: `Pinned memory limit (${LIMITS.maxPinned}) reached; unpin one first` };
+			const line = change.kind === "upsert" && change.indexLine !== undefined ? change.indexLine : formatIndexLine(targetRef, memory.frontmatter.name, memory.frontmatter.description);
+			if (/[\r\n]/.test(line) || indexLineTarget(line) !== targetRef) return { ok: false, error: `Index entry must be one line linking to ${targetRef}` };
+			nextIndex = changeIndex(nextIndex, targetRef, line);
+			if (nextIndex.trimEnd().split("\n").length > LIMITS.indexMaxLines) return { ok: false, error: `MEMORY.md index would exceed ${LIMITS.indexMaxLines} lines; merge or prune entries first` };
+			if (nextIndex.trimEnd().length > LIMITS.indexMaxBytes) return { ok: false, error: `MEMORY.md index would exceed ${LIMITS.indexMaxBytes} characters; shorten or prune entries first` };
+		}
+		const modified: string[] = [];
+		try {
+			if (change.kind !== "delete") { writeFileSafe(target, content); modified.push(target); }
+			writeFileSafe(index, nextIndex); modified.push(index);
+			if (change.kind !== "upsert") { fs.unlinkSync(source); modified.push(source); }
+			return { ok: true };
+		} catch (error) {
+			try {
+				for (const file of modified.reverse()) {
+					const bytes = original.get(file);
+					if (bytes) writeFileSafe(file, bytes);
+					else fs.rmSync(file, { force: true });
+				}
+			} catch (rollbackError) {
+				throw new AggregateError([error, rollbackError], "Memory update failed and rollback failed; inspect the memory file and MEMORY.md before retrying");
+			}
+			throw new Error("Memory update failed; original files were restored", { cause: error });
+		}
+	});
+}
+
+export function writeFileSafe(absolutePath: string, content: string | Buffer): void {
 	fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
-	// Staged write (tmp + rename). Claude Code's local memory writes go
-	// through the harness Write/Edit tools' own atomicity; this is the
-	// plugin-side equivalent, not a port of a specific CC memory function.
-	// a crash mid-write must never leave a truncated memory file or index.
-	const tmp = `${absolutePath}.${process.pid}.${Date.now()}.tmp`;
-	fs.writeFileSync(tmp, content);
-	fs.renameSync(tmp, absolutePath);
-}
-
-export function deleteFileSafe(absolutePath: string): boolean {
+	const tmp = `${absolutePath}.${process.pid}.${randomUUID()}.tmp`;
 	try {
-		fs.unlinkSync(absolutePath);
-		return true;
-	} catch {
-		return false;
+		fs.writeFileSync(tmp, content, { flag: "wx" });
+		fs.renameSync(tmp, absolutePath);
+	} finally {
+		fs.rmSync(tmp, { force: true });
 	}
 }
 
@@ -250,8 +359,4 @@ export function readFileOrNull(absolutePath: string): string | null {
 	} catch {
 		return null;
 	}
-}
-
-export function countPinned(memories: MemoryFileInfo[]): number {
-	return memories.filter((m) => m.pinned).length;
 }

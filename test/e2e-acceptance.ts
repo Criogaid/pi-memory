@@ -130,19 +130,19 @@ check("[5] recall deduped on repeat", r5b?.message === undefined);
 const pauseCmd = commands.get("pause-memory")!;
 await pauseCmd.handler({}, mkCtx());
 const memFileAbs = path.join(memRoot, slugDir, savedFiles[0]);
-const r6: any = await handlers.get("tool_call")!({ toolName: "write", input: { path: memFileAbs, content: "x" } });
+const r6: any = await handlers.get("tool_call")!({ toolName: "write", input: { path: memFileAbs, content: "x" } }, mkCtx());
 check("[6] write to memory blocked when paused", r6?.block === true, r6?.reason ?? "");
-const r6b: any = await handlers.get("tool_call")!({ toolName: "write", input: { path: path.join(tmp, "normal.md"), content: "x" } });
+const r6b: any = await handlers.get("tool_call")!({ toolName: "write", input: { path: path.join(tmp, "normal.md"), content: "x" } }, mkCtx());
 check("[6] normal write unaffected", r6b === undefined);
-const r6c: any = await handlers.get("tool_call")!({ toolName: "memory_save", input: { name: "x", type: "user", description: "d", body: "b" } });
+const r6c: any = await handlers.get("tool_call")!({ toolName: "memory_save", input: { name: "x", type: "user", description: "d", body: "b" } }, mkCtx());
 check("[6] memory_save blocked when paused", r6c?.block === true);
 await pauseCmd.handler({}, mkCtx()); // resume
 
 // 6p) pause read-deny (c6) and write-deny (Si) carry their own messages
 await pauseCmd.handler({}, mkCtx()); // pause again
-const r6p: any = await handlers.get("tool_call")!({ toolName: "read", input: { path: memFileAbs } });
+const r6p: any = await handlers.get("tool_call")!({ toolName: "read", input: { path: memFileAbs } }, mkCtx());
 check("[6p] read blocked with c6 message", r6p?.block === true && r6p.reason === "Cannot read memory while it is paused. Run /pause-memory to resume automemory.");
-const r6q: any = await handlers.get("tool_call")!({ toolName: "write", input: { path: memFileAbs, content: "x" } });
+const r6q: any = await handlers.get("tool_call")!({ toolName: "write", input: { path: memFileAbs, content: "x" } }, mkCtx());
 check("[6p] write blocked with Si message", r6q?.block === true && r6q.reason === "Cannot write to memory while it is paused. Run /pause-memory to resume automemory.");
 await pauseCmd.handler({}, mkCtx()); // resume
 
@@ -223,7 +223,7 @@ await pauseCmd.handler({}, mkCtx());
 const r11: any = await handlers.get("input")!({ text: "# paused shortcut attempt", source: "interactive", images: [] }, mkCtx());
 check("[11] paused # shortcut handled with notice", r11?.action === "handled");
 // 11b) paused read of a memory file is blocked (Claude Code denies reads too)
-const r11b: any = await handlers.get("tool_call")!({ toolName: "read", input: { path: path.join(memRoot, slugDir, "style-tabs.md") } });
+const r11b: any = await handlers.get("tool_call")!({ toolName: "read", input: { path: path.join(memRoot, slugDir, "style-tabs.md") } }, mkCtx());
 check("[11b] read of memory blocked when paused", r11b?.block === true);
 await pauseCmd.handler({}, mkCtx()); // resume
 
@@ -241,7 +241,7 @@ check("[12] /remember completions list personal memories", Array.isArray(complet
 // 14) round-11/12 hardening: reserved names, normalization, index-line flattening
 const r14a = await save.execute("t5", { name: "con", type: "user", description: "x", body: "y" }, undefined, undefined, mkCtx());
 check("[14] Windows reserved name blocked", r14a.isError === true);
-const r14b = await save.execute("t6", { name: "crlf-test", type: "user", description: "d", body: "line one\r\nline two\x0bdone", indexLine: "- [T](crlf-test.md) — a\n- INJECTED LINE" }, undefined, undefined, mkCtx());
+await save.execute("t6", { name: "crlf-test", type: "user", description: "d", body: "line one\r\nline two\x0bdone", indexLine: "- [T](crlf-test.md) — a\n- INJECTED LINE" }, undefined, undefined, mkCtx());
 const stored14 = fs.readFileSync(path.join(memRoot, slugDir, "crlf-test.md"), "utf-8");
 check("[14] CRLF/vertical-tab normalized", stored14.includes("line one\nline two\uFFFDdone") && !stored14.includes("\r"));
 const idx14 = fs.readFileSync(path.join(memRoot, slugDir, "MEMORY.md"), "utf-8");
@@ -254,11 +254,11 @@ check(
 // 15) enabled toggle makes the extension fully inert
 {
 	const choice = `Turn pi-memory ${true ? "off" : "on"} for this session`;
-	await commands.get("memory")!.handler("", { ...mkCtx(), hasUI: true, ui: { ...mkCtx().ui, select: async (_t: string, items: string[]) => choice } });
+	await commands.get("memory")!.handler("", { ...mkCtx(), hasUI: true, ui: { ...mkCtx().ui, select: async (_t: string, _items: string[]) => choice } });
 	const inert: any = await handlers.get("before_agent_start")!({ systemPrompt: "BASE", prompt: "how do I run the tests here" }, mkCtx());
 	check("[15] disabled: no prompt injection", inert?.systemPrompt === "BASE" || inert === undefined);
 	check("[15] disabled: no recall", inert?.message === undefined);
-	const r15 = await handlers.get("tool_call")!({ toolName: "write", input: { path: memFileAbs, content: "x" } });
+	const r15 = await handlers.get("tool_call")!({ toolName: "write", input: { path: memFileAbs, content: "x" } }, mkCtx());
 	check("[15] disabled: no pause-gating of file tools", r15 === undefined);
 }
 
@@ -266,9 +266,9 @@ check(
 {
 	// [15] left the extension disabled — re-enable first.
 	const choice = `Turn pi-memory ${false ? "off" : "on"} for this session`;
-	await commands.get("memory")!.handler("", { ...mkCtx(), hasUI: true, ui: { ...mkCtx().ui, select: async (_t: string, items: string[]) => choice } });
+	await commands.get("memory")!.handler("", { ...mkCtx(), hasUI: true, ui: { ...mkCtx().ui, select: async (_t: string, _items: string[]) => choice } });
 	const probePaused = async () => {
-		const r: any = await handlers.get("tool_call")!({ toolName: "write", input: { path: memFileAbs, content: "x" } });
+		const r: any = await handlers.get("tool_call")!({ toolName: "write", input: { path: memFileAbs, content: "x" } }, mkCtx());
 		return r?.block === true;
 	};
 	await pauseCmd.handler({}, mkCtx()); // on
@@ -306,7 +306,7 @@ check(
 {
 	// disable via panel
 	const off = `Turn pi-memory ${true ? "off" : "on"} for this session`;
-	await commands.get("memory")!.handler("", { ...mkCtx(), hasUI: true, ui: { ...mkCtx().ui, select: async (_t: string, items: string[]) => off } });
+	await commands.get("memory")!.handler("", { ...mkCtx(), hasUI: true, ui: { ...mkCtx().ui, select: async (_t: string, _items: string[]) => off } });
 	check("[19] disabled drops memory_save from active tools", !(pi.getActiveTools() as string[]).includes("memory_save"), JSON.stringify(pi.getActiveTools()));
 	const r19a = await save.execute("t19", { name: "sneaky", type: "user", description: "d", body: "b" }, undefined, undefined, mkCtx());
 	check("[19] disabled: memory_save execute errors", r19a.isError === true);
@@ -314,7 +314,7 @@ check(
 	check("[19] disabled: # shortcut stays plain text", r19b?.action === "continue");
 	// re-enable for /remember check
 	const on = `Turn pi-memory ${false ? "off" : "on"} for this session`;
-	await commands.get("memory")!.handler("", { ...mkCtx(), hasUI: true, ui: { ...mkCtx().ui, select: async (_t: string, items: string[]) => on } });
+	await commands.get("memory")!.handler("", { ...mkCtx(), hasUI: true, ui: { ...mkCtx().ui, select: async (_t: string, _items: string[]) => on } });
 	check("[19] re-enabled restores memory_save", (pi.getActiveTools() as string[]).includes("memory_save"));
 	await commands.get("remember")!.handler("style-tabs.md", mkCtx());
 	const idx19 = fs.readFileSync(path.join(memRoot, slugDir, "MEMORY.md"), "utf-8");
@@ -337,7 +337,7 @@ check(
 	// stampProvenance refresh via the write tool_result hook (HD/nQt port)
 	const stampFile = path.join(paths20.personalDir, "stamped-probe.md");
 	fs.writeFileSync(stampFile, "---\nname: stamped-probe\ndescription: probe\nmetadata:\n  type: user\noriginSessionId: session-old\nmodified: 2020-01-01T00:00:00.000Z\n---\n\nbody\n");
-	await handlers.get("tool_result")!({ toolName: "write", input: { path: stampFile } });
+	await handlers.get("tool_result")!({ toolName: "write", input: { path: stampFile } }, mkCtx());
 	const stamped20 = fs.readFileSync(stampFile, "utf-8");
 	check("[20] stamp keeps originSessionId", stamped20.includes("originSessionId: session-old"));
 	check("[20] stamp refreshes modified", !stamped20.includes("2020-01-01") && /modified: 20\d\d-/.test(stamped20));
@@ -395,7 +395,7 @@ check(
 	// HD fresh-stamp path canonicalizes a raw model-written file.
 	const fresh21 = path.join(paths21.personalDir, "fresh-probe.md");
 	fs.writeFileSync(fresh21, "---\nname: Fresh_Probe File\ndescription: probe\nmetadata:\n  type: user\n---\n\nbody\n");
-	await handlers.get("tool_result")!({ toolName: "write", input: { path: fresh21 } });
+	await handlers.get("tool_result")!({ toolName: "write", input: { path: fresh21 } }, mkCtx());
 	const stamped21 = fs.readFileSync(fresh21, "utf-8");
 	check("[21] fresh stamp slugifies name", /^name: fresh-probe-file$/m.test(stamped21));
 	check("[21] fresh stamp nests provenance", /metadata:\n  node_type: memory\n  type: user\n  originSessionId: sess-e2e\n  modified: 20\d\d-/.test(stamped21));
