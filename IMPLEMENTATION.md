@@ -139,7 +139,7 @@ Installed-host verification: Pi 0.99.1 loaded the extension through its real RPC
 
 Development dependencies are pinned to pi 0.99.1 (typebox 1.3.27, matching pi), and the runtime peer range is `>=0.99.1 <0.100`. The upgrade exists so memory jobs can pass a provider-neutral thinking level: pi 0.85's public `ModelRegistry` exposes only provider-specific `complete` options, while 0.99 adds `completeSimple`/`streamSimple` with `reasoning`. Pi 0.99's tool path normalization (`utils/paths.js` `normalizePath`/`resolvePath`) was compared with `resolveToolPath` and matches; the helper is still not exported.
 
-Verification: `npm run check` reports no business-code errors; one test-file type error remains (`test/regressions.test.ts` passes an `ExtensionContext` where 0.99 tool execution expects `ExtensionToolContext`) and is handed off with the test work. All 70 regressions and lifecycle acceptance pass at runtime on 0.99.1; `git diff --check` passes.
+Verification: the Pi 0.99.1 test harness migration is complete; see [Model-selection regression evidence](#model-selection-regression-evidence) for the checks and coverage.
 
 ## Background job model selection
 
@@ -147,4 +147,14 @@ Verification: `npm run check` reports no business-code errors; one test-file typ
 
 The `/memory` panel adds two model rows. Activating one replaces the list with a search picker built from pi's `Input`, `SelectList`, and `fuzzyFilter`, following pi-codex-compaction's summary-model picker, then a thinking-level selection. The command reopens the panel afterwards. RPC/print summaries include the current selections.
 
-Verification: `npm run check` reports no business-code errors; the only remaining error is the test-file type error recorded in the dependency-upgrade section. Tests were not run for this milestone by request; test updates are handed off.
+Verification: the test handoff is complete; see [Model-selection regression evidence](#model-selection-regression-evidence).
+
+## Model-selection regression evidence
+
+The test harness supplies `ExtensionToolContext` to tool execution and mocks `ModelRegistry.streamSimple(...).result()` with typed model/message fixtures. Existing response sequences and cancellation remain covered, including abort-signal delivery and rejection of late writes. Both suites isolate the home directory before importing the plugin; Jiti captures namespace imports, so installing that mock after import does not isolate global configuration reads. Per-session memory and project files remain under temporary roots.
+
+Added 25 regressions for foreground-model fallback, configured models and reasoning (including `off`), missing credentials/models, unsupported thinking, and notices preserved alongside model failures or Dream completion-write failures. Cache checks compare identity across repeated jobs, read rounds, job kinds, and sessions, and verify that requests do not disable caching. Configuration tests cover global/project precedence, trimming, invalid overrides, explicit `null`, reloads, preservation of unknown settings, and refusal to overwrite malformed files.
+
+Native Pi widgets are driven through mock `ui.custom` and `ui.select` boundaries. Tests verify reopening with the selected model, immediate use by subsequent jobs, cancellation at either selection stage, session-model restoration, provider-default reasoning, and preservation of the active selection after a save failure. RPC summaries and failure notifications preserve generated model identities and failure payloads. Assertions cover observable state, persistence, and data delivery; they do not pin prompt prose, UI labels, diagnostic wording, fixed defaults, or JSON layout.
+
+Verification passed: `npm run check`; `npm test` (95 regressions and lifecycle acceptance); `npm run check -- --noUnusedLocals --noUnusedParameters`; `git diff --check`. This milestone changes only tests and this evidence record; `src/` is unchanged. The requested test handoff is complete.

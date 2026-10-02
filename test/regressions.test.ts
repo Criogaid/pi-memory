@@ -2,24 +2,37 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { test } from "node:test";
+import { after, test } from "node:test";
 import { fork } from "node:child_process";
 import { once } from "node:events";
-import { createEditTool, createWriteTool, initTheme, SessionManager, withFileMutationQueue, type ExtensionAPI, type ExtensionContext, type ToolDefinition, type RegisteredCommand } from "@earendil-works/pi-coding-agent";
-import type { Component, TUI } from "@earendil-works/pi-tui";
+import { createEditTool, createWriteTool, initTheme, SessionManager, withFileMutationQueue, type ExtensionAPI, type ExtensionContext, type ExtensionToolContext, type ToolDefinition, type RegisteredCommand } from "@earendil-works/pi-coding-agent";
+import { getKeybindings, type Component, type TUI } from "@earendil-works/pi-tui";
 import { setTimeout as delay } from "node:timers/promises";
 import type { BeforeAgentStartEventResult } from "@earendil-works/pi-coding-agent";
-import type { Context } from "@earendil-works/pi-ai";
-import factory from "../src/index.ts";
-import { LIMITS, loadConfig, resolvePaths } from "../src/config.ts";
-import { readDreamState } from "../src/dream.ts";
-import { applyExtractOps, collectEntriesSince } from "../src/extract.ts";
-import { parseMemory, serializeMemory } from "../src/frontmatter.ts";
-import { listMemories, truncateMemory } from "../src/store.ts";
-import { MemoryJobs, type MemoryJobRequest } from "../src/workflow.ts";
+import type { Api, Context, Model } from "@earendil-works/pi-ai";
+import type { JobModelKey, JobModelSelection } from "../src/config.ts";
+import type { MemoryJobRequest } from "../src/workflow.ts";
+import { isolateMemoryHome } from "./fixtures/memory-home.ts";
+import { assistantMessage, modelFixture } from "./fixtures/model-runtime.ts";
+
+// Jiti captures namespace imports, so install the home boundary before loading the plugin.
+const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-home-"));
+const memoryHome = isolateMemoryHome(homeRoot);
+after(() => { memoryHome.restore(); fs.rmSync(homeRoot, { recursive: true, force: true }); });
+const { default: factory } = await import("../src/index.ts");
+const { JOB_MODEL_SETTINGS, MEMORY_SWITCHES, LIMITS, expandHome, loadConfig, resolvePaths } = await import("../src/config.ts");
+const { DreamRunner, readDreamState } = await import("../src/dream.ts");
+const { applyExtractOps, collectEntriesSince } = await import("../src/extract.ts");
+const { parseMemory, serializeMemory } = await import("../src/frontmatter.ts");
+const { listMemories, truncateMemory } = await import("../src/store.ts");
+const { MemoryJobs } = await import("../src/workflow.ts");
+const { saveJobModel } = await import("../src/persistence.ts");
+assert.equal(expandHome("~"), path.join(homeRoot, "home"));
 
 type Handler = (event: unknown, ctx: ExtensionContext) => unknown | Promise<unknown>;
 interface Command { handler: (args: string, ctx: ExtensionContext) => unknown | Promise<unknown>; getArgumentCompletions?: RegisteredCommand["getArgumentCompletions"]; }
+type StreamOptions = Parameters<ExtensionContext["modelRegistry"]["streamSimple"]>[2];
+interface ModelCall { readonly model: Model<Api>; readonly options: StreamOptions; }
 
 async function withSession(run: (session: Awaited<ReturnType<typeof createSession>>) => Promise<void>) {
 	const session = await createSession();
@@ -42,26 +55,40 @@ async function createSession() {
 	const notifications: string[] = [];
 	let modelCalls = 0;
 	let modelReply: (request: Context) => Promise<string> | string = () => '{"ops":[]}';
+	const sessionModel = modelFixture();
+	const registeredModels = [{ model: sessionModel, authenticated: true }];
+	const modelRequests: ModelCall[] = [];
 	const parentRule = crypto.randomUUID();
 	const config = loadConfig(cwd);
 	let activeTools = ["read", "write", "edit", "memory_save"];
 	let waitForIdle = async () => {};
 	// Only host boundary objects are mocked; history and persistence use the real implementations.
 	let panel: (Component & { dispose?(): void }) | undefined;
+	let panelDriver: ((component: Component, dialog: number) => void | Promise<void>) | undefined;
+	let dialogCount = 0;
+	let selectReply: (items: readonly string[]) => string | undefined | Promise<string | undefined> = () => undefined;
 	const custom = async (build: (tui: Pick<TUI, "requestRender">, theme: unknown, keybindings: unknown, done: (value: unknown) => void) => Component | Promise<Component>) => {
 		initTheme("dark");
 		const closed = Promise.withResolvers<unknown>();
-		panel = await build({ requestRender: () => {} }, undefined, undefined, closed.resolve);
-		try { return await closed.promise; } finally { panel?.dispose?.(); panel = undefined; }
+		panel = await build({ requestRender: () => {} }, undefined, getKeybindings(), closed.resolve);
+		const current = panel;
+		try { await panelDriver?.(current, ++dialogCount); return await closed.promise; }
+		finally { current.dispose?.(); if (panel === current) panel = undefined; }
 	};
 	const ctx = {
-		cwd, hasUI: true, mode: "tui", sessionManager: manager, model: { id: "test-model" },
-		modelRegistry: { complete: async (_model: unknown, request: Context) => {
-			modelCalls++;
-			return { role: "assistant", stopReason: "stop", content: [{ type: "text", text: await modelReply(request) }], timestamp: Date.now() };
-		} },
+		cwd, hasUI: true, mode: "tui", sessionManager: manager, model: sessionModel,
+		modelRegistry: {
+			find: (provider: string, id: string) => registeredModels.find(({ model }) => model.provider === provider && model.id === id)?.model,
+			hasConfiguredAuth: (model: Model<Api>) => registeredModels.some((entry) => entry.model === model && entry.authenticated),
+			getAvailable: () => registeredModels.filter((entry) => entry.authenticated).map((entry) => entry.model),
+			streamSimple: (model: Model<Api>, request: Context, options: StreamOptions) => {
+				modelCalls++;
+				modelRequests.push({ model, options: options && { ...options } });
+				return { result: async () => assistantMessage(model, await modelReply(request)) };
+			},
+		},
 		getSystemPrompt: () => parentRule,
-		ui: { notify: (text: string) => notifications.push(text), setStatus: () => {}, select: async () => undefined, custom },
+		ui: { notify: (text: string) => notifications.push(text), setStatus: () => {}, select: async (_title: string, items: string[]) => selectReply(items), custom },
 		waitForIdle: () => waitForIdle(),
 	} as unknown as ExtensionContext;
 	const api = {
@@ -83,7 +110,11 @@ async function createSession() {
 	const save = async (name: string, extra: Record<string, unknown> = {}) => {
 		const tool = tools.get("memory_save");
 		assert.ok(tool);
-		return tool.execute(name, { name, type: "feedback", description: "Durable preference", body: "Preserve prior knowledge", ...extra }, undefined, undefined, ctx);
+		const toolContext: ExtensionToolContext = {
+			...ctx, tools: [],
+			executeTool: async () => assert.fail("Nested tool execution is not expected in this harness"),
+		};
+		return tool.execute(name, { name, type: "feedback", description: "Durable preference", body: "Preserve prior knowledge", ...extra }, undefined, undefined, toolContext);
 	};
 	const turn = async (prompt: string) => {
 		manager.appendMessage({ role: "user", content: prompt, timestamp: Date.now() });
@@ -94,6 +125,10 @@ async function createSession() {
 	await emit("session_start");
 	return {
 		root, cwd, ctx, config, paths: resolvePaths(cwd, config), manager, notifications, emit, command, save, turn,
+		globalConfigFile: memoryHome.globalConfigFile, modelRequests,
+		registerModel: (model: Model<Api>, authenticated = true) => registeredModels.push({ model, authenticated }),
+		setPanelDriver: (driver: typeof panelDriver) => { panelDriver = driver; },
+		setSelectReply: (reply: typeof selectReply) => { selectReply = reply; },
 		panel: () => panel,
 		complete: (prefix: string) => commands.get("memory")?.getArgumentCompletions?.(prefix),
 		modelCalls: () => modelCalls,
@@ -107,6 +142,7 @@ async function createSession() {
 			process.chdir(previousCwd);
 			if (previousRoot === undefined) delete process.env.PI_MEMORY_DIR;
 			else process.env.PI_MEMORY_DIR = previousRoot;
+			fs.rmSync(memoryHome.globalConfigFile, { force: true });
 			fs.rmSync(root, { recursive: true, force: true });
 		},
 	};
@@ -116,9 +152,9 @@ function memory(name: string, body: string, pinned = false) {
 	return serializeMemory({ name, description: `description ${name}`, type: "project", pinned, originSessionId: "test", modified: new Date().toISOString() }, body);
 }
 
-function runMemoryJob(s: Awaited<ReturnType<typeof createSession>>, kind: MemoryJobRequest["kind"]) {
+function runMemoryJob(s: Awaited<ReturnType<typeof createSession>>, kind: MemoryJobRequest["kind"], model?: JobModelSelection) {
 	return new MemoryJobs().run(s.ctx, {
-		kind, paths: s.paths, sessionId: s.manager.getSessionId(),
+		kind, model, paths: s.paths, sessionId: s.manager.getSessionId(),
 		systemPrompt: s.parentRule, prompt: crypto.randomUUID(),
 	});
 }
@@ -456,7 +492,9 @@ test("pause discards a late model response before it can write", async () => wit
 	s.addUser("Remember this durable project preference");
 	const extraction = s.emit("agent_settled");
 	await started.promise;
+	assert.equal(s.modelRequests.at(-1)?.options?.signal?.aborted, false);
 	await s.command("pause-memory");
+	assert.equal(s.modelRequests.at(-1)?.options?.signal?.aborted, true);
 	response.resolve(JSON.stringify({ ops: [{ op: "upsert", file: "late.md", type: "project", description: "Late", body: crypto.randomUUID() }] }));
 	await extraction;
 	assert.equal(fs.existsSync(path.join(s.paths.personalDir, "late.md")), false);
@@ -1027,4 +1065,326 @@ test("reapplying current memory and pause settings does not cancel extraction", 
 		await settled;
 	}
 	assert.equal(parseMemory(fs.readFileSync(path.join(s.paths.personalDir, "uninterrupted.md"), "utf8")).body.trim(), payload);
+}));
+
+test("unconfigured jobs use the foreground model without overriding reasoning", async () => withSession(async (s) => {
+	for (const kind of ["extract", "dream"] as const) {
+		const result = await runMemoryJob(s, kind);
+		assert.equal(result.status, "completed");
+		assert.equal(s.modelRequests.at(-1)?.model, s.ctx.model);
+		assert.equal(s.modelRequests.at(-1)?.options?.reasoning, undefined);
+		assert.equal(result.notices?.length ?? 0, 0);
+	}
+}));
+
+for (const thinkingLevel of [undefined, "high", "off"] as const) {
+	test(`configured jobs route to their authenticated model with thinking ${thinkingLevel ?? "unset"}`, async () => withSession(async (s) => {
+		const model = modelFixture();
+		s.registerModel(model);
+		const result = await runMemoryJob(s, "extract", { provider: model.provider, model: model.id, thinkingLevel });
+		assert.equal(result.status, "completed");
+		assert.equal(s.modelRequests.at(-1)?.model, model);
+		assert.equal(s.modelRequests.at(-1)?.options?.reasoning, thinkingLevel === "off" ? undefined : thinkingLevel);
+		assert.equal(result.notices?.length ?? 0, 0);
+	}));
+}
+
+for (const available of ["missing", "unauthenticated"] as const) {
+	test(`a ${available} job model falls back without preventing memory writes`, async () => withSession(async (s) => {
+		const model = modelFixture(), payload = crypto.randomUUID();
+		if (available === "unauthenticated") s.registerModel(model, false);
+		s.setModelReply(() => JSON.stringify({ ops: [{ op: "upsert", file: "fallback.md", type: "project", description: payload, body: payload }] }));
+		const result = await runMemoryJob(s, "extract", { provider: model.provider, model: model.id, thinkingLevel: "high" });
+		assert.equal(result.status, "completed");
+		assert.equal(result.applied, 1);
+		assert.equal(result.notices?.length, 1);
+		assert.equal(s.modelRequests.at(-1)?.model, s.ctx.model);
+		assert.equal(s.modelRequests.at(-1)?.options?.reasoning, undefined);
+		assert.equal(parseMemory(fs.readFileSync(path.join(s.paths.personalDir, "fallback.md"), "utf8")).body.trim(), payload);
+	}));
+}
+
+test("unsupported reasoning keeps the selected model and reports a notice", async () => withSession(async (s) => {
+	const model = modelFixture({ reasoning: false });
+	s.registerModel(model);
+	const result = await runMemoryJob(s, "dream", { provider: model.provider, model: model.id, thinkingLevel: "high" });
+	assert.equal(result.status, "completed");
+	assert.equal(s.modelRequests.at(-1)?.model, model);
+	assert.equal(s.modelRequests.at(-1)?.options?.reasoning, undefined);
+	assert.equal(result.notices?.length, 1);
+}));
+
+test("stream failures preserve model fallback notices and the provider failure", async () => withSession(async (s) => {
+	const failure = crypto.randomUUID();
+	s.setModelReply(() => { throw new Error(failure); });
+	const result = await runMemoryJob(s, "extract", { provider: crypto.randomUUID(), model: crypto.randomUUID() });
+	assert.equal(result.status, "failed");
+	assert.equal(result.notices?.length, 1);
+	assert.ok(result.errors.some((error) => error.includes(failure)));
+	assert.equal(result.applied, 0);
+}));
+
+test("background cache identity survives read rounds and repeated jobs but separates kind and session", async () => withSession(async (s) => {
+	fs.writeFileSync(path.join(s.paths.personalDir, "cache-input.md"), memory("cache-input", crypto.randomUUID()));
+	let round = 0;
+	s.setModelReply(() => JSON.stringify(++round % 2 ? { read: ["cache-input.md"] } : { ops: [] }));
+	for (const kind of ["extract", "extract", "dream", "dream"] as const) {
+		assert.equal((await runMemoryJob(s, kind)).status, "completed");
+	}
+	const requests = s.modelRequests;
+	assert.equal(requests.length, 8);
+	const extractId = requests[0]?.options?.sessionId, dreamId = requests[4]?.options?.sessionId;
+	assert.ok(extractId && dreamId);
+	assert.ok(requests.slice(0, 4).every((call) => call.options?.sessionId === extractId));
+	assert.ok(requests.slice(4).every((call) => call.options?.sessionId === dreamId));
+	assert.notEqual(extractId, dreamId);
+	const foregroundId = s.manager.getSessionId();
+	assert.notEqual(extractId, foregroundId);
+	assert.notEqual(dreamId, foregroundId);
+	s.manager.newSession();
+	assert.notEqual(s.manager.getSessionId(), foregroundId);
+	assert.equal((await runMemoryJob(s, "extract")).status, "completed");
+	assert.notEqual(requests.at(-1)?.options?.sessionId, extractId);
+	assert.notEqual(requests.at(-1)?.options?.sessionId, s.manager.getSessionId());
+	assert.ok(requests.every((call) => call.options?.cacheRetention !== "none"));
+}));
+
+for (const { key } of JOB_MODEL_SETTINGS) {
+	test(`${key} merges valid project values, ignores invalid overrides, and clears inherited selections`, async () => withSession(async (s) => {
+		const inherited = { provider: crypto.randomUUID(), model: crypto.randomUUID(), thinkingLevel: "low" };
+		fs.writeFileSync(s.globalConfigFile, JSON.stringify({ extractModel: inherited, dreamModel: inherited }));
+		const file = path.join(s.cwd, ".pi", "memory.json");
+		const otherKey = key === "extractModel" ? "dreamModel" : "extractModel";
+		assert.deepEqual(loadConfig(s.cwd)[key], inherited);
+		for (const invalid of [[], false, 42, "model", {}, { provider: "  ", model: "id" }, { provider: "p", model: " " }, { provider: 7, model: "id" }]) {
+			fs.writeFileSync(file, JSON.stringify({ [key]: invalid }));
+			assert.deepEqual(loadConfig(s.cwd)[key], inherited);
+			assert.deepEqual(loadConfig(s.cwd)[otherKey], inherited);
+		}
+		const selected = { provider: crypto.randomUUID(), model: crypto.randomUUID(), thinkingLevel: "high" };
+		fs.writeFileSync(file, JSON.stringify({ [key]: { provider: ` ${selected.provider}\t`, model: `\t${selected.model} `, thinkingLevel: " high " } }));
+		assert.deepEqual(loadConfig(s.cwd)[key], selected);
+		assert.deepEqual(loadConfig(s.cwd)[otherKey], inherited);
+		fs.writeFileSync(file, JSON.stringify({ [key]: null }));
+		assert.equal(loadConfig(s.cwd)[key], undefined);
+		assert.deepEqual(loadConfig(s.cwd)[otherKey], inherited);
+	}));
+
+	test(`${key} persists selections and explicit session fallback while preserving unrelated settings`, async () => withSession(async (s) => {
+		const selection = { provider: crypto.randomUUID(), model: crypto.randomUUID(), thinkingLevel: "medium" };
+		const unknown = { [crypto.randomUUID()]: [crypto.randomUUID(), { value: crypto.randomUUID() }] };
+		const otherKey = key === "extractModel" ? "dreamModel" : "extractModel";
+		const original = { unknown, [otherKey]: { provider: crypto.randomUUID(), model: crypto.randomUUID() }, recall: false };
+		const file = path.join(s.cwd, ".pi", "memory.json");
+		fs.writeFileSync(file, JSON.stringify(original));
+		fs.writeFileSync(s.globalConfigFile, JSON.stringify({ [key]: selection }));
+		await saveJobModel(s.cwd, key, selection);
+		assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), { ...original, [key]: selection });
+		assert.deepEqual(loadConfig(s.cwd)[key], selection);
+		await saveJobModel(s.cwd, key, null);
+		assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), { ...original, [key]: null });
+		assert.equal(loadConfig(s.cwd)[key], undefined);
+		for (const malformed of ["{", "null", "[]", JSON.stringify(crypto.randomUUID())]) {
+			fs.writeFileSync(file, malformed);
+			await assert.rejects(saveJobModel(s.cwd, key, selection));
+			assert.equal(fs.readFileSync(file, "utf8"), malformed);
+		}
+	}));
+}
+
+test("extraction and Dream use independent configured models without changing the foreground model", async () => withSession(async (s) => {
+	const extract = modelFixture(), dream = modelFixture(), foreground = s.ctx.model;
+	s.registerModel(extract); s.registerModel(dream);
+	await saveJobModel(s.cwd, "extractModel", { provider: extract.provider, model: extract.id, thinkingLevel: "high" });
+	await saveJobModel(s.cwd, "dreamModel", { provider: dream.provider, model: dream.id, thinkingLevel: "low" });
+	await s.emit("session_start");
+	s.addUser(crypto.randomUUID());
+	await s.command("memory-extract");
+	await s.command("dream");
+	assert.deepEqual(s.modelRequests.map(({ model, options }) => ({ model, reasoning: options?.reasoning })), [
+		{ model: extract, reasoning: "high" }, { model: dream, reasoning: "low" },
+	]);
+	assert.equal(s.ctx.model, foreground);
+	assert.ok(readDreamState(s.paths).lastCompletedAt !== null);
+}));
+
+for (const [key, command] of [["extractModel", "memory-extract"], ["dreamModel", "dream"]] as const) {
+	test(`${command} delivers fallback identity and provider failure to the user`, async () => withSession(async (s) => {
+		const missing = crypto.randomUUID(), failure = crypto.randomUUID();
+		await saveJobModel(s.cwd, key, { provider: crypto.randomUUID(), model: missing });
+		await s.emit("session_start");
+		s.setModelReply(() => { throw new Error(failure); });
+		await s.command(command);
+		assert.ok(s.notifications.some((notification) => notification.includes(missing) && notification.includes(failure)));
+	}));
+}
+
+test("Dream retains notices and applied writes when recording completion fails", async () => withSession(async (s) => {
+	const payload = crypto.randomUUID();
+	s.setModelReply(() => {
+		// Fail the completion write after the attempt state and model work have begun.
+		const stateFile = path.join(s.paths.personalDir, ".dream-state.json");
+		fs.unlinkSync(stateFile);
+		fs.mkdirSync(stateFile);
+		return JSON.stringify({ ops: [{ op: "upsert", file: "dream-applied.md", type: "project", description: payload, body: payload }] });
+	});
+	const result = await new DreamRunner(new MemoryJobs()).run(s.ctx, {
+		automatic: false, paths: s.paths, sessionId: s.manager.getSessionId(), systemPrompt: s.parentRule,
+		model: { provider: crypto.randomUUID(), model: crypto.randomUUID() },
+	});
+	assert.equal(result.status, "partial");
+	assert.equal(result.applied, 1);
+	assert.equal(result.notices?.length, 1);
+	assert.ok(result.errors.length > 0);
+	assert.ok(result.written.includes("dream-applied.md"));
+	assert.equal(parseMemory(fs.readFileSync(path.join(s.paths.personalDir, "dream-applied.md"), "utf8")).body.trim(), payload);
+}));
+
+function openModelRow(panel: Component, key: JobModelKey) {
+	const modelIndex = JOB_MODEL_SETTINGS.findIndex((setting) => setting.key === key);
+	assert.ok(modelIndex >= 0);
+	// The branch pause row is inserted among the persisted switches.
+	for (let row = 0; row < MEMORY_SWITCHES.length + 1 + modelIndex; row++) panel.handleInput?.("\u001b[B");
+	panel.handleInput?.("\r");
+}
+
+function pickModel(panel: Component, model: Model<Api>) {
+	for (const character of model.id) panel.handleInput?.(character);
+	panel.handleInput?.("\u001b[B");
+	panel.handleInput?.("\r");
+}
+
+for (const { key } of JOB_MODEL_SETTINGS) {
+	test(`${key} picker persists the choice, reopens with that value, and updates the next job`, async () => withSession(async (s) => {
+		const model = modelFixture(), thinkingLevel = key === "extractModel" ? "high" : "off";
+		s.registerModel(model);
+		s.setSelectReply(() => thinkingLevel);
+		let reopened = false;
+		s.setPanelDriver((panel, dialog) => {
+			if (dialog === 1) openModelRow(panel, key);
+			else if (dialog === 2) pickModel(panel, model);
+			else {
+				reopened = true;
+				assert.ok(panel.render(240).join("\n").includes(model.id));
+				panel.handleInput?.("\u001b");
+			}
+		});
+		await s.command("memory");
+		assert.ok(reopened);
+		assert.deepEqual(loadConfig(s.cwd)[key], { provider: model.provider, model: model.id, thinkingLevel });
+		await s.command(key === "extractModel" ? "memory-extract" : "dream");
+		assert.equal(s.modelRequests.at(-1)?.model, model);
+		assert.equal(s.modelRequests.at(-1)?.options?.reasoning, thinkingLevel === "off" ? undefined : thinkingLevel);
+	}));
+}
+
+for (const cancelAt of ["model", "thinking"] as const) {
+	test(`cancelling the ${cancelAt} picker reopens the panel without changing persisted or active selection`, async () => withSession(async (s) => {
+		const original = modelFixture(), candidate = modelFixture();
+		s.registerModel(original); s.registerModel(candidate);
+		await saveJobModel(s.cwd, "extractModel", { provider: original.provider, model: original.id });
+		await s.emit("session_start");
+		const file = path.join(s.cwd, ".pi", "memory.json"), before = fs.readFileSync(file, "utf8");
+		let reopened = false;
+		s.setSelectReply(() => undefined);
+		s.setPanelDriver((panel, dialog) => {
+			if (dialog === 1) openModelRow(panel, "extractModel");
+			else if (dialog === 2) {
+				if (cancelAt === "model") panel.handleInput?.("\u001b");
+				else pickModel(panel, candidate);
+			} else {
+				reopened = true;
+				assert.ok(panel.render(240).join("\n").includes(original.id));
+				panel.handleInput?.("\u001b");
+			}
+		});
+		await s.command("memory");
+		assert.ok(reopened);
+		assert.equal(fs.readFileSync(file, "utf8"), before);
+		await s.command("memory-extract");
+		assert.equal(s.modelRequests.at(-1)?.model, original);
+	}));
+}
+
+test("choosing the session model persists null over global config and updates the active job", async () => withSession(async (s) => {
+	const inherited = modelFixture();
+	s.registerModel(inherited);
+	fs.writeFileSync(s.globalConfigFile, JSON.stringify({ dreamModel: { provider: inherited.provider, model: inherited.id, thinkingLevel: "high" } }));
+	await s.emit("session_start");
+	let reopened = false;
+	s.setSelectReply(() => assert.fail("Session selection must not ask for a thinking level"));
+	s.setPanelDriver((panel, dialog) => {
+		if (dialog === 1) openModelRow(panel, "dreamModel");
+		else if (dialog === 2) panel.handleInput?.("\r");
+		else { reopened = true; panel.handleInput?.("\u001b"); }
+	});
+	await s.command("memory");
+	assert.ok(reopened);
+	const persisted: unknown = JSON.parse(fs.readFileSync(path.join(s.cwd, ".pi", "memory.json"), "utf8"));
+	assert.ok(typeof persisted === "object" && persisted !== null && "dreamModel" in persisted);
+	assert.equal(persisted.dreamModel, null);
+	assert.equal(loadConfig(s.cwd).dreamModel, undefined);
+	await s.command("dream");
+	assert.equal(s.modelRequests.at(-1)?.model, s.ctx.model);
+	assert.equal(s.modelRequests.at(-1)?.options?.reasoning, undefined);
+}));
+
+test("choosing provider thinking defaults removes a previously configured level", async () => withSession(async (s) => {
+	const model = modelFixture();
+	s.registerModel(model);
+	await saveJobModel(s.cwd, "extractModel", { provider: model.provider, model: model.id, thinkingLevel: "high" });
+	await s.emit("session_start");
+	s.setSelectReply((items) => items[0]);
+	s.setPanelDriver((panel, dialog) => {
+		if (dialog === 1) openModelRow(panel, "extractModel");
+		else if (dialog === 2) pickModel(panel, model);
+		else panel.handleInput?.("\u001b");
+	});
+	await s.command("memory");
+	assert.deepEqual(loadConfig(s.cwd).extractModel, { provider: model.provider, model: model.id });
+	await s.command("memory-extract");
+	assert.equal(s.modelRequests.at(-1)?.model, model);
+	assert.equal(s.modelRequests.at(-1)?.options?.reasoning, undefined);
+}));
+
+test("RPC settings summary delivers both configured model identities", async () => withSession(async (s) => {
+	const extract = { provider: crypto.randomUUID(), model: crypto.randomUUID() };
+	const dream = { provider: crypto.randomUUID(), model: crypto.randomUUID(), thinkingLevel: "high" };
+	await saveJobModel(s.cwd, "extractModel", extract);
+	await saveJobModel(s.cwd, "dreamModel", dream);
+	await s.emit("session_start");
+	s.ctx.mode = "rpc";
+	await s.command("memory");
+	const report = s.notifications.at(-1);
+	assert.ok(report);
+	for (const selection of [extract, dream]) {
+		assert.ok(report.includes(selection.provider));
+		assert.ok(report.includes(selection.model));
+	}
+	assert.equal(s.panel(), undefined);
+}));
+
+test("a failed model-setting save reopens the panel and keeps the active selection", async () => withSession(async (s) => {
+	const original = modelFixture(), candidate = modelFixture();
+	s.registerModel(original); s.registerModel(candidate);
+	await saveJobModel(s.cwd, "extractModel", { provider: original.provider, model: original.id });
+	await s.emit("session_start");
+	const file = path.join(s.cwd, ".pi", "memory.json"), malformed = `{${crypto.randomUUID()}`;
+	fs.writeFileSync(file, malformed);
+	s.setSelectReply(() => "high");
+	let reopened = false;
+	s.setPanelDriver((panel, dialog) => {
+		if (dialog === 1) openModelRow(panel, "extractModel");
+		else if (dialog === 2) pickModel(panel, candidate);
+		else {
+			reopened = true;
+			assert.ok(panel.render(240).join("\n").includes(original.id));
+			panel.handleInput?.("\u001b");
+		}
+	});
+	await s.command("memory");
+	assert.ok(reopened);
+	assert.equal(fs.readFileSync(file, "utf8"), malformed);
+	await s.command("memory-extract");
+	assert.equal(s.modelRequests.at(-1)?.model, original);
 }));

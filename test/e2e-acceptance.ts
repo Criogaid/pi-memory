@@ -9,8 +9,13 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
+import { isolateMemoryHome } from "./fixtures/memory-home.ts";
+import { assistantMessage, modelFixture } from "./fixtures/model-runtime.ts";
 
 const tmp = fs.mkdtempSync(os.tmpdir() + "/pi-e2e-");
+const memoryHome = isolateMemoryHome(tmp);
+const sessionModel = modelFixture();
 const memRoot = path.join(tmp, "mem");
 // Project-local config enables team memory; env injects the memory root so
 // the test never touches the real ~/.pi.
@@ -63,7 +68,7 @@ console.log("commands:", [...commands.keys()].join(","));
 console.log("entry renderers:", [...entryRenderers.keys()].join(","));
 
 const branch: any[] = [];
-function mkCtx(opts: { complete?: Function } = {}) {
+function mkCtx(opts: { reply?: () => Promise<Partial<AssistantMessage>> } = {}) {
 	return {
 		cwd: process.cwd(),
 		hasUI: true,
@@ -79,9 +84,12 @@ function mkCtx(opts: { complete?: Function } = {}) {
 			getSessionId: () => "sess-e2e",
 			getSessionDir: () => path.join(tmp, "sessions"),
 		},
-		model: { id: "mock-model" },
+		model: sessionModel,
 		getSystemPrompt: () => "",
-		modelRegistry: { complete: opts.complete ?? (async () => { throw new Error("no model call expected"); }) },
+		modelRegistry: { streamSimple: () => ({ result: async (): Promise<AssistantMessage> => {
+			if (!opts.reply) throw new Error("No model call expected");
+			return { ...assistantMessage(sessionModel, ""), ...await opts.reply() };
+		} }) },
 		signal: undefined,
 		waitForIdle: async () => {},
 	};
@@ -169,10 +177,10 @@ for (const [role, text] of [
 	branch.push({ type: "message", id: `e${branch.length}`, message: { role, content: [{ type: "text", text }], timestamp: Date.now() } });
 }
 let settledCalled = false;
-await handlers.get("agent_settled")!({}, mkCtx({ complete: async () => { settledCalled = true; return { content: [] }; } }));
+await handlers.get("agent_settled")!({}, mkCtx({ reply: async () => { settledCalled = true; return { content: [] }; } }));
 check("[7] settled extraction skipped after direct writes", !settledCalled);
 const extractCtx = mkCtx({
-	complete: async () => ({
+	reply: async () => ({
 		content: [{ type: "text", text: `{"ops":[{"op":"upsert","file":"style-tabs.md","type":"feedback","description":"prefer tabs","body":"Use tabs. **Why:** user corrected me."}]}` }],
 	}),
 });
@@ -185,7 +193,7 @@ check("[7] cursor (lastExtractedId) persisted", typeof extractEntry?.data?.lastE
 
 // 7b) settled again with no new messages -> no model call
 let modelCalled = false;
-await handlers.get("agent_settled")!({}, mkCtx({ complete: async () => { modelCalled = true; return { content: [] }; } }));
+await handlers.get("agent_settled")!({}, mkCtx({ reply: async () => { modelCalled = true; return { content: [] }; } }));
 check("[7b] no re-extraction without new messages", !modelCalled);
 check("[7c] no evil.md leaked from traversal attempt", !files.includes("evil.md"));
 
@@ -200,7 +208,7 @@ check("[8] personal copy removed", !fs.existsSync(path.join(memRoot, slugDir, "t
 check("[8] index points at team/", fs.readFileSync(path.join(memRoot, slugDir, "MEMORY.md"), "utf-8").includes("(team/test-runner.md)"));
 
 // 8b) Dream records completion without changing memories on a no-op run.
-await commands.get("dream")!.handler("", mkCtx({ complete: async () => ({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: JSON.stringify({ ops: [] }) }], timestamp: Date.now() }) }));
+await commands.get("dream")!.handler("", mkCtx({ reply: async () => ({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: JSON.stringify({ ops: [] }) }], timestamp: Date.now() }) }));
 check("[8b] dream persists successful completion", readDreamState(resolvePaths(tmp, loadConfig(tmp))).lastCompletedAt !== null);
 
 // 9) reload restores the extraction cursor from persisted entries
@@ -401,6 +409,7 @@ check(
 
 // Leave tmp before removing it — Windows locks the process cwd's directory.
 process.chdir(os.tmpdir());
+memoryHome.restore();
 fs.rmSync(tmp, { recursive: true, force: true });
 console.log(failures === 0 ? "\nE2E ACCEPTANCE: ALL PASS" : `\nE2E ACCEPTANCE: ${failures} FAILURE(S)`);
 process.exit(failures === 0 ? 0 : 1);
