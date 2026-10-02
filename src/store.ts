@@ -218,7 +218,7 @@ function canonicalPath(target: string): string {
 	}
 }
 
-function containsPath(root: string, target: string): boolean {
+export function containsPath(root: string, target: string): boolean {
 	const relative = path.relative(root, target);
 	return relative === "" || (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`));
 }

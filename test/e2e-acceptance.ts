@@ -20,7 +20,8 @@ process.env.PI_MEMORY_DIR = memRoot;
 process.chdir(tmp);
 const { default: factory } = await import("../src/index.ts");
 const { parseMemory, slugName } = await import("../src/frontmatter.ts");
-const { LIMITS } = await import("../src/config.ts");
+const { LIMITS, loadConfig, resolvePaths } = await import("../src/config.ts");
+const { readDreamState } = await import("../src/dream.ts");
 
 const handlers = new Map<string, Function>();
 const tools = new Map<string, any>();
@@ -76,6 +77,7 @@ function mkCtx(opts: { complete?: Function } = {}) {
 			getBranch: () => [...entries, ...branch],
 			getEntries: () => entries,
 			getSessionId: () => "sess-e2e",
+			getSessionDir: () => path.join(tmp, "sessions"),
 		},
 		model: { id: "mock-model" },
 		getSystemPrompt: () => "",
@@ -197,9 +199,9 @@ check("[8] promoted to team dir", fs.existsSync(path.join(process.cwd(), ".pi", 
 check("[8] personal copy removed", !fs.existsSync(path.join(memRoot, slugDir, "test-runner.md")));
 check("[8] index points at team/", fs.readFileSync(path.join(memRoot, slugDir, "MEMORY.md"), "utf-8").includes("(team/test-runner.md)"));
 
-// 8b) dream command sends the consolidation prompt
-await commands.get("dream")!.handler({}, mkCtx());
-check("[8b] dream schedules a user turn", typeof pi._sent === "string" && pi._sent.length > 0);
+// 8b) Dream records completion without changing memories on a no-op run.
+await commands.get("dream")!.handler("", mkCtx({ complete: async () => ({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: JSON.stringify({ ops: [] }) }], timestamp: Date.now() }) }));
+check("[8b] dream persists successful completion", readDreamState(resolvePaths(tmp, loadConfig(tmp))).lastCompletedAt !== null);
 
 // 9) reload restores the extraction cursor from persisted entries
 await handlers.get("session_start")!({}, mkCtx());
@@ -244,7 +246,7 @@ check(
 
 // 15) enabled toggle makes the extension fully inert
 {
-	await commands.get("memory")!.handler("", { ...mkCtx(), hasUI: true, ui: { ...mkCtx().ui, select: async (_t: string, items: string[]) => items[4] } });
+	await commands.get("memory")!.handler("off", mkCtx());
 	const inert: any = await handlers.get("before_agent_start")!({ systemPrompt: "BASE", prompt: "how do I run the tests here" }, mkCtx());
 	check("[15] disabled: no prompt injection", inert?.systemPrompt === "BASE" || inert === undefined);
 	check("[15] disabled: no recall", inert?.message === undefined);
@@ -255,7 +257,7 @@ check(
 // 16) pause persists across a session reload (state entry, last-one-wins)
 {
 	// [15] left the extension disabled — re-enable first.
-	await commands.get("memory")!.handler("", { ...mkCtx(), hasUI: true, ui: { ...mkCtx().ui, select: async (_t: string, items: string[]) => items[4] } });
+	await commands.get("memory")!.handler("on", mkCtx());
 	const probePaused = async () => {
 		const r: any = await handlers.get("tool_call")!({ toolName: "write", input: { path: memFileAbs, content: "x" } }, mkCtx());
 		return r?.block === true;
@@ -294,15 +296,14 @@ check(
 // 19) final-audit regressions: disabled removes the tool, # stays inert,
 //     /remember leaves no stale personal index line
 {
-	// disable via panel
-	await commands.get("memory")!.handler("", { ...mkCtx(), hasUI: true, ui: { ...mkCtx().ui, select: async (_t: string, items: string[]) => items[4] } });
+	await commands.get("memory")!.handler("off", mkCtx());
 	check("[19] disabled drops memory_save from active tools", !(pi.getActiveTools() as string[]).includes("memory_save"), JSON.stringify(pi.getActiveTools()));
 	const r19a = await save.execute("t19", { name: "sneaky", type: "user", description: "d", body: "b" }, undefined, undefined, mkCtx());
 	check("[19] disabled: memory_save execute errors", r19a.isError === true);
 	const r19b: any = await handlers.get("input")!({ text: "# still works when enabled only", source: "interactive", images: [] }, mkCtx());
 	check("[19] disabled: # shortcut stays plain text", r19b?.action === "continue");
 	// re-enable for /remember check
-	await commands.get("memory")!.handler("", { ...mkCtx(), hasUI: true, ui: { ...mkCtx().ui, select: async (_t: string, items: string[]) => items[4] } });
+	await commands.get("memory")!.handler("on", mkCtx());
 	check("[19] re-enabled restores memory_save", (pi.getActiveTools() as string[]).includes("memory_save"));
 	await commands.get("remember")!.handler("style-tabs.md", mkCtx());
 	const idx19 = fs.readFileSync(path.join(memRoot, slugDir, "MEMORY.md"), "utf-8");
@@ -312,7 +313,7 @@ check(
 // 20) Provenance, UTF-8 truncation, recall selection, and shortcut behavior.
 {
 	const { readMemoryFile } = await import("../src/store.ts");
-	const paths20 = { personalDir: path.join(memRoot, slugDir), teamDir: path.join(process.cwd(), ".pi", "memory"), configFile: "" };
+	const paths20 = { personalDir: path.join(memRoot, slugDir), teamDir: path.join(process.cwd(), ".pi", "memory") };
 
 	// stampProvenance refresh via the write tool_result hook (HD/nQt port)
 	const stampFile = path.join(paths20.personalDir, "stamped-probe.md");
@@ -348,7 +349,7 @@ check(
 
 // 21) Serialization round-trips and direct writes acquire provenance.
 {
-	const paths21 = { personalDir: path.join(memRoot, slugDir), teamDir: path.join(process.cwd(), ".pi", "memory"), configFile: "" };
+	const paths21 = { personalDir: path.join(memRoot, slugDir), teamDir: path.join(process.cwd(), ".pi", "memory") };
 
 	// ps(): conforming names pass through; non-conforming ones hyphenate (incl. underscores).
 	check("[21] ps conforming passthrough", slugName("already_slug") === "already_slug");
@@ -393,7 +394,7 @@ check(
 // Internal Dream turns must not recall otherwise-relevant stored memories.
 {
 	const { buildDreamPrompt } = await import("../src/extract.ts");
-	const dream = buildDreamPrompt({ personalDir: memRoot, teamDir: null, configFile: "" }, "sessions");
+	const dream = buildDreamPrompt({ personalDir: memRoot, teamDir: null }, "sessions");
 	const result = await handlers.get("before_agent_start")!({ systemPrompt: "BASE", prompt: dream }, mkCtx());
 	check("internal Dream turn skips recall", result?.message === undefined);
 }

@@ -1,5 +1,5 @@
 /**
- * pi-memory configuration: directory layout, slugs, and per-session flags.
+ * pi-memory configuration: project identity, directory layout, and persisted flags.
  *
  * Directory layout mirrors Claude Code's auto-memory:
  *   personal memory  ~/.pi/agent/memory/<project-slug>/
@@ -38,6 +38,10 @@ export type MemoryType = "user" | "feedback" | "project" | "reference";
 export const MEMORY_TYPES: readonly MemoryType[] = ["user", "feedback", "project", "reference"];
 
 export interface MemoryConfig {
+	/** Persisted project switch; branch-local pause is separate. */
+	enabled: boolean;
+	/** Opt-in consolidation after settled foreground work. */
+	autoDream: boolean;
 	/** Override the personal memory root (default: ~/.pi/agent/memory). */
 	memoryDir?: string;
 	/** Project-local shared memory (<cwd>/.pi/memory) read/written by the agent. */
@@ -52,7 +56,10 @@ export interface MemoryConfig {
 	citeMemories: boolean;
 }
 
+// Keep README.md Configuration defaults aligned with this object.
 const DEFAULTS: MemoryConfig = {
+	enabled: true,
+	autoDream: false,
 	sharedMemory: false,
 	autoExtract: true,
 	autoExtractMinMessages: 1,
@@ -80,7 +87,6 @@ export function legacyMemoryDir(cwd: string, paths: MemoryPaths): string {
 export interface MemoryPaths {
 	personalDir: string;
 	teamDir: string | null;
-	configFile: string;
 }
 
 export function resolvePaths(cwd: string, config: MemoryConfig): MemoryPaths {
@@ -93,7 +99,6 @@ export function resolvePaths(cwd: string, config: MemoryConfig): MemoryPaths {
 	return {
 		personalDir: path.join(root, projectSlug(cwd)),
 		teamDir: config.sharedMemory ? path.join(cwd, ".pi", "memory") : null,
-		configFile: path.join(root, "config.json"),
 	};
 }
 
@@ -101,6 +106,10 @@ export function expandHome(p: string): string {
 	if (p === "~") return os.homedir();
 	if (p.startsWith("~/") || p.startsWith("~\\")) return path.join(os.homedir(), p.slice(2));
 	return p;
+}
+
+export function projectConfigFile(cwd: string): string {
+	return path.join(cwd, ".pi", "memory.json");
 }
 
 export function loadConfig(cwd: string): MemoryConfig {
@@ -111,18 +120,21 @@ export function loadConfig(cwd: string): MemoryConfig {
 	// the user's real home directory.
 	const candidates = [
 		path.join(os.homedir(), ".pi", "agent", "memory", "config.json"),
-		path.join(cwd, ".pi", "memory.json"),
+		projectConfigFile(cwd),
 	];
 	for (const file of candidates) {
 		try {
-			const raw = JSON.parse(fs.readFileSync(file, "utf-8")) as Partial<MemoryConfig>;
-			if (typeof raw.memoryDir === "string") config.memoryDir = raw.memoryDir;
-			if (typeof raw.sharedMemory === "boolean") config.sharedMemory = raw.sharedMemory;
-			if (typeof raw.autoExtract === "boolean") config.autoExtract = raw.autoExtract;
-			if (typeof raw.autoExtractMinMessages === "number")
+			const raw: unknown = JSON.parse(fs.readFileSync(file, "utf-8"));
+			if (typeof raw !== "object" || raw === null || Array.isArray(raw)) continue;
+			if ("enabled" in raw && typeof raw.enabled === "boolean") config.enabled = raw.enabled;
+			if ("autoDream" in raw && typeof raw.autoDream === "boolean") config.autoDream = raw.autoDream;
+			if ("memoryDir" in raw && typeof raw.memoryDir === "string") config.memoryDir = raw.memoryDir;
+			if ("sharedMemory" in raw && typeof raw.sharedMemory === "boolean") config.sharedMemory = raw.sharedMemory;
+			if ("autoExtract" in raw && typeof raw.autoExtract === "boolean") config.autoExtract = raw.autoExtract;
+			if ("autoExtractMinMessages" in raw && typeof raw.autoExtractMinMessages === "number" && Number.isFinite(raw.autoExtractMinMessages))
 				config.autoExtractMinMessages = Math.max(1, Math.floor(raw.autoExtractMinMessages));
-			if (typeof raw.recall === "boolean") config.recall = raw.recall;
-			if (typeof raw.citeMemories === "boolean") config.citeMemories = raw.citeMemories;
+			if ("recall" in raw && typeof raw.recall === "boolean") config.recall = raw.recall;
+			if ("citeMemories" in raw && typeof raw.citeMemories === "boolean") config.citeMemories = raw.citeMemories;
 		} catch {
 			// missing or unparsable file: keep defaults
 		}

@@ -3,11 +3,14 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
+import { fork } from "node:child_process";
+import { once } from "node:events";
 import { SessionManager, type ExtensionAPI, type ExtensionContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { BeforeAgentStartEventResult } from "@earendil-works/pi-coding-agent";
 import type { Context } from "@earendil-works/pi-ai";
 import factory from "../src/index.ts";
-import { LIMITS, resolvePaths } from "../src/config.ts";
+import { LIMITS, loadConfig, resolvePaths } from "../src/config.ts";
+import { readDreamState } from "../src/dream.ts";
 import { applyExtractOps, collectEntriesSince } from "../src/extract.ts";
 import { parseMemory, serializeMemory } from "../src/frontmatter.ts";
 import { listMemories } from "../src/store.ts";
@@ -26,18 +29,20 @@ async function createSession() {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-regression-"));
 	const cwd = path.join(root, "project");
 	fs.mkdirSync(path.join(cwd, ".pi"), { recursive: true });
-	fs.writeFileSync(path.join(cwd, ".pi", "memory.json"), JSON.stringify({ sharedMemory: true }));
+	fs.writeFileSync(path.join(cwd, ".pi", "memory.json"), JSON.stringify({ sharedMemory: true, enabled: true, autoExtract: true, autoDream: false, autoExtractMinMessages: 1, recall: true, citeMemories: false }));
 	process.env.PI_MEMORY_DIR = path.join(root, "mem");
 	process.chdir(cwd);
 	const handlers = new Map<string, Handler>();
 	const commands = new Map<string, Command>();
 	const tools = new Map<string, ToolDefinition>();
-	const manager = SessionManager.inMemory(cwd);
+	const manager = SessionManager.create(cwd, path.join(root, "sessions"));
 	const notifications: string[] = [];
 	let modelCalls = 0;
 	let modelReply: (request: Context) => Promise<string> | string = () => '{"ops":[]}';
 	const parentRule = crypto.randomUUID();
-	const config = { memoryDir: path.join(root, "mem"), sharedMemory: true, autoExtract: true, autoExtractMinMessages: 1, recall: true, citeMemories: false };
+	const config = loadConfig(cwd);
+	let activeTools = ["read", "write", "edit", "memory_save"];
+	let waitForIdle = async () => {};
 	// Only host boundary objects are mocked; history and persistence use the real implementations.
 	const ctx = {
 		cwd, hasUI: true, sessionManager: manager, model: { id: "test-model" },
@@ -47,7 +52,7 @@ async function createSession() {
 		} },
 		getSystemPrompt: () => parentRule,
 		ui: { notify: (text: string) => notifications.push(text), setStatus: () => {}, select: async () => undefined },
-		waitForIdle: async () => {},
+		waitForIdle: () => waitForIdle(),
 	} as unknown as ExtensionContext;
 	const api = {
 		on: (name: string, handler: Handler) => handlers.set(name, handler),
@@ -55,8 +60,8 @@ async function createSession() {
 		registerCommand: (name: string, command: Command) => commands.set(name, command),
 		registerEntryRenderer: () => {},
 		appendEntry: (name: string, data: unknown) => manager.appendCustomEntry(name, data),
-		getActiveTools: () => ["read", "write", "edit", "memory_save"],
-		setActiveTools: () => {}, sendUserMessage: () => {},
+		getActiveTools: () => activeTools,
+		setActiveTools: (names: string[]) => { activeTools = names; }, sendUserMessage: () => {},
 	} as unknown as ExtensionAPI;
 	factory(api);
 	const emit = async (name: string, event: unknown = {}) => handlers.get(name)?.(event, ctx);
@@ -81,6 +86,8 @@ async function createSession() {
 		root, cwd, config, paths: resolvePaths(cwd, config), manager, notifications, emit, command, save, turn,
 		modelCalls: () => modelCalls,
 		parentRule,
+		activeTools: () => activeTools,
+		setIdleWaiter: (waiter: () => Promise<void>) => { waitForIdle = waiter; },
 		setModelReply: (reply: typeof modelReply) => { modelReply = reply; },
 		addUser: (text: string) => manager.appendMessage({ role: "user", content: text, timestamp: Date.now() }),
 		close: async () => {
@@ -472,4 +479,232 @@ test("cancellation prevents queued effects while preserving earlier committed op
 	await extraction;
 	assert.equal(fs.existsSync(second), false);
 	assert.equal(fs.existsSync(path.join(s.paths.personalDir, "first.md")), true);
+}));
+
+function addHistoricalSession(s: Awaited<ReturnType<typeof createSession>>, text: string) {
+	const manager = SessionManager.create(s.cwd, s.manager.getSessionDir());
+	manager.appendMessage({ role: "user", content: text, timestamp: Date.now() });
+	manager.appendMessage({ role: "assistant", content: [{ type: "text", text: crypto.randomUUID() }], api: "openai-completions", provider: "fixture", model: "fixture", stopReason: "stop", timestamp: Date.now(), usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } });
+	return manager;
+}
+
+test("project switches survive reload and preserve unrelated settings", async () => withSession(async (s) => {
+	const file = path.join(s.cwd, ".pi", "memory.json");
+	const unrelated = crypto.randomUUID();
+	fs.writeFileSync(file, JSON.stringify({ sharedMemory: true, custom: unrelated }));
+	await s.command("memory", "auto-extract off");
+	await s.command("memory", "auto-dream on");
+	await s.command("memory", "off");
+	await s.emit("session_start");
+	assert.equal(s.activeTools().includes("memory_save"), false);
+	await s.save("disabled");
+	assert.equal(fs.existsSync(path.join(s.paths.personalDir, "disabled.md")), false);
+	const config = loadConfig(s.cwd);
+	assert.equal(config.enabled, false);
+	assert.equal(config.autoExtract, false);
+	assert.equal(config.autoDream, true);
+	assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).custom, unrelated);
+	await s.command("memory", "on");
+	await s.emit("session_start");
+	assert.ok(s.activeTools().includes("memory_save"));
+	await s.save("enabled");
+	assert.ok(fs.existsSync(path.join(s.paths.personalDir, "enabled.md")));
+}));
+
+test("invalid settings remain intact and failed saves do not change running switches", async () => withSession(async (s) => {
+	const file = path.join(s.cwd, ".pi", "memory.json");
+	const broken = crypto.randomUUID();
+	fs.writeFileSync(file, broken);
+	await s.command("memory", "off");
+	assert.equal(fs.readFileSync(file, "utf8"), broken);
+	await s.save("still-enabled");
+	assert.ok(fs.existsSync(path.join(s.paths.personalDir, "still-enabled.md")));
+}));
+
+test("manual Dream delivers live and saved Pi contexts and records a successful no-op", async () => withSession(async (s) => {
+	const live = crypto.randomUUID(), historical = crypto.randomUUID();
+	s.addUser(live);
+	addHistoricalSession(s, historical);
+	await s.save("unchanged");
+	const file = path.join(s.paths.personalDir, "unchanged.md");
+	const content = fs.readFileSync(file, "utf8");
+	fs.utimesSync(file, new Date(0), new Date(0));
+	s.setModelReply((request) => {
+		assert.ok(request.systemPrompt?.includes(s.parentRule));
+		assert.ok(JSON.stringify(request.messages).includes(live));
+		assert.ok(JSON.stringify(request.messages).includes(historical));
+		return JSON.stringify({ ops: [] });
+	});
+	const before = Date.now();
+	await s.command("dream");
+	const state = readDreamState(s.paths);
+	assert.ok(state.lastCompletedAt !== null && state.lastCompletedAt >= before);
+	assert.ok(state.through >= before && state.through <= state.lastCompletedAt);
+	assert.equal(fs.readFileSync(file, "utf8"), content);
+	assert.equal(fs.statSync(file).mtimeMs, 0);
+}));
+
+test("Dream reads project evidence through Pi and preserves memory facts while consolidating", async () => withSession(async (s) => {
+	const evidence = crypto.randomUUID(), retained = crypto.randomUUID();
+	fs.writeFileSync(path.join(s.cwd, "policy.txt"), evidence);
+	await s.save("policy", { body: retained });
+	let calls = 0;
+	s.setModelReply((request) => {
+		if (++calls === 1) return JSON.stringify({ readProject: ["policy.txt"] });
+		assert.ok(JSON.stringify(request.messages).includes(evidence));
+		if (calls === 2) return JSON.stringify({ read: ["policy.md"] });
+		assert.ok(JSON.stringify(request.messages).includes(retained));
+		return JSON.stringify({ ops: [{ op: "upsert", file: "policy.md", type: "project", description: "policy", body: `${retained}\n${evidence}` }] });
+	});
+	await s.command("dream");
+	const result = parseMemory(fs.readFileSync(path.join(s.paths.personalDir, "policy.md"), "utf8"));
+	assert.ok(result.body.includes(evidence) && result.body.includes(retained));
+	assert.ok(readDreamState(s.paths).lastCompletedAt !== null);
+}));
+
+test("Dream rejects project reads through an escaping directory link", async () => withSession(async (s) => {
+	const outside = path.join(s.root, "outside");
+	fs.mkdirSync(outside);
+	fs.writeFileSync(path.join(outside, "private.txt"), crypto.randomUUID());
+	fs.symlinkSync(outside, path.join(s.cwd, "linked"), "junction");
+	s.setModelReply(() => JSON.stringify({ readProject: ["linked/private.txt"] }));
+	await s.command("dream");
+	assert.equal(s.modelCalls(), 1);
+	assert.equal(readDreamState(s.paths).lastCompletedAt, null);
+}));
+
+test("automatic Dream waits for new sessions and throttles both failures and successes", async () => withSession(async (s) => {
+	await s.command("memory", "auto-extract off");
+	await s.command("memory", "auto-dream on");
+	s.addUser(crypto.randomUUID());
+	await s.emit("agent_settled");
+	assert.equal(s.modelCalls(), 0);
+	for (let i = 0; i < 6; i++) addHistoricalSession(s, crypto.randomUUID());
+	s.setModelReply(() => { throw new Error(crypto.randomUUID()); });
+	await s.emit("agent_settled");
+	const failedCalls = s.modelCalls();
+	assert.ok(failedCalls > 0);
+	assert.equal(readDreamState(s.paths).lastCompletedAt, null);
+	await s.emit("agent_settled");
+	assert.equal(s.modelCalls(), failedCalls);
+	s.setModelReply(() => JSON.stringify({ ops: [] }));
+	await s.command("dream");
+	assert.ok(readDreamState(s.paths).lastCompletedAt !== null);
+	const completedCalls = s.modelCalls();
+	for (let i = 0; i < 6; i++) addHistoricalSession(s, crypto.randomUUID());
+	await s.emit("agent_settled");
+	assert.equal(s.modelCalls(), completedCalls);
+}));
+
+test("automatic Dream can consolidate with extraction disabled and stays disabled until opted in", async () => withSession(async (s) => {
+	await s.command("memory", "auto-extract off");
+	for (let i = 0; i < 6; i++) addHistoricalSession(s, crypto.randomUUID());
+	s.setModelReply(() => JSON.stringify({ ops: [] }));
+	await s.emit("agent_settled");
+	assert.equal(s.modelCalls(), 0);
+	await s.command("memory", "auto-dream on");
+	await s.emit("agent_settled");
+	assert.ok(s.modelCalls() > 0);
+	assert.ok(readDreamState(s.paths).lastCompletedAt !== null);
+}));
+
+test("pausing Dream discards late output and leaves completion unadvanced", async () => withSession(async (s) => {
+	const response = Promise.withResolvers<string>(), started = Promise.withResolvers<void>();
+	s.setModelReply(() => { started.resolve(); return response.promise; });
+	const running = s.command("dream");
+	await started.promise;
+	await s.command("pause-memory");
+	response.resolve(JSON.stringify({ ops: [{ op: "upsert", file: "late.md", type: "project", description: "late", body: crypto.randomUUID() }] }));
+	await running;
+	assert.equal(fs.existsSync(path.join(s.paths.personalDir, "late.md")), false);
+	assert.equal(readDreamState(s.paths).lastCompletedAt, null);
+	await s.command("pause-memory");
+	s.setModelReply(() => JSON.stringify({ ops: [] }));
+	await s.command("dream");
+	assert.ok(readDreamState(s.paths).lastCompletedAt !== null);
+}));
+
+test("partial Dream keeps committed memories without marking consolidation complete", async () => withSession(async (s) => {
+	const saved = crypto.randomUUID();
+	s.setModelReply(() => JSON.stringify({ ops: [
+		{ op: "upsert", file: "durable.md", type: "project", description: "durable", body: saved },
+		{ op: "upsert", file: "invalid.md", type: "unsupported", description: "invalid", body: crypto.randomUUID() },
+	] }));
+	await s.command("dream");
+	assert.ok(parseMemory(fs.readFileSync(path.join(s.paths.personalDir, "durable.md"), "utf8")).body.includes(saved));
+	assert.equal(fs.existsSync(path.join(s.paths.personalDir, "invalid.md")), false);
+	assert.equal(readDreamState(s.paths).lastCompletedAt, null);
+}));
+
+test("Dream cannot promote private knowledge into a new team file", async () => withSession(async (s) => {
+	s.setModelReply(() => JSON.stringify({ ops: [{ op: "upsert", file: "team/private.md", type: "project", description: "private", body: crypto.randomUUID() }] }));
+	await s.command("dream");
+	assert.equal(fs.existsSync(path.join(s.paths.teamDir!, "private.md")), false);
+	assert.equal(readDreamState(s.paths).lastCompletedAt, null);
+}));
+
+test("another process holding Dream state prevents model execution and releases ownership", async () => withSession(async (s) => {
+	s.setModelReply(() => JSON.stringify({ ops: [] }));
+	await s.command("dream");
+	const state = readDreamState(s.paths);
+	const count = s.modelCalls();
+	const child = fork(new URL("./fixtures/hold-state-lock.ts", import.meta.url), [path.join(s.paths.personalDir, ".dream-state.json")], { cwd: new URL("..", import.meta.url), execArgv: ["--import", "jiti/register"], stdio: ["ignore", "ignore", "inherit", "ipc"] });
+	const exited = once(child, "exit");
+	try {
+		await Promise.race([once(child, "message"), exited.then(() => { throw new Error("Lock worker exited before acquiring ownership"); })]);
+		await s.command("dream");
+		assert.equal(s.modelCalls(), count);
+		assert.deepEqual(readDreamState(s.paths), state);
+		child.send({ release: true });
+		await exited;
+		await s.command("dream");
+		assert.ok(s.modelCalls() > count);
+	} finally {
+		if (child.exitCode === null) child.kill();
+		await exited;
+	}
+}));
+
+test("pausing during Pi session enumeration cancels Dream before model execution", async (t) => withSession(async (s) => {
+	const started = Promise.withResolvers<void>();
+	const listed = Promise.withResolvers<Awaited<ReturnType<typeof SessionManager.list>>>();
+	t.mock.method(SessionManager, "list", () => { started.resolve(); return listed.promise; });
+	const running = s.command("dream");
+	await started.promise;
+	await s.command("pause-memory");
+	await running;
+	listed.resolve([]);
+	assert.equal(s.modelCalls(), 0);
+	assert.equal(readDreamState(s.paths).lastAttemptAt, null);
+}));
+
+test("automatic Dream requires elapsed completion time and resumes after the interval", async () => withSession(async (s) => {
+	await s.command("memory", "auto-extract off");
+	await s.command("memory", "auto-dream on");
+	s.setModelReply(() => JSON.stringify({ ops: [] }));
+	await s.command("dream");
+	const state = readDreamState(s.paths);
+	const file = path.join(s.paths.personalDir, ".dream-state.json");
+	const yesterday = Date.now() - 48 * 60 * 60_000;
+	// Arrange an expired retry window with a recent successful completion.
+	fs.writeFileSync(file, JSON.stringify({ ...state, lastAttemptAt: yesterday, through: yesterday }));
+	for (let i = 0; i < 6; i++) addHistoricalSession(s, crypto.randomUUID());
+	const count = s.modelCalls();
+	await s.emit("agent_settled");
+	assert.equal(s.modelCalls(), count);
+	fs.writeFileSync(file, JSON.stringify({ ...state, lastAttemptAt: yesterday, lastCompletedAt: yesterday, through: yesterday }));
+	await s.emit("agent_settled");
+	assert.ok(s.modelCalls() > count);
+	assert.ok(readDreamState(s.paths).through > yesterday);
+}));
+
+test("Dream waiting for foreground idle cannot start in a replacement session", async () => withSession(async (s) => {
+	const idle = Promise.withResolvers<void>();
+	s.setIdleWaiter(() => idle.promise);
+	const running = s.command("dream");
+	await s.emit("session_start");
+	idle.resolve();
+	await running;
+	assert.equal(s.modelCalls(), 0);
+	assert.equal(readDreamState(s.paths).lastAttemptAt, null);
 }));

@@ -28,15 +28,14 @@
 import { StringEnum, uuidv7 } from "@earendil-works/pi-ai";
 import {
 	convertToLlm,
-	getAgentDir,
 	serializeConversation,
 	truncateTail,
 	withFileMutationQueue,
 	type ExtensionAPI,
 	type ExtensionContext,
+	type ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
-import { join as pathJoin } from "node:path";
 import { Type } from "typebox";
 import {
 	LIMITS,
@@ -48,7 +47,6 @@ import {
 } from "./config.js";
 import { serializeMemory, slugName, stampProvenance } from "./frontmatter.js";
 import {
-	buildDreamPrompt,
 	buildExtractionPrompt,
 	checkExtractionGates,
 	collectEntriesSince,
@@ -60,6 +58,8 @@ import {
 import { buildIndexSection, buildMemoryPromptSection, buildPinnedSection } from "./prompt.js";
 import { RecallSession, recallForPrompt } from "./recall.js";
 import { MemoryJobs } from "./workflow.js";
+import { DreamRunner, readDreamState } from "./dream.js";
+import { saveMemorySwitches, type MemorySwitches } from "./persistence.js";
 import {
 	ensureDirs,
 	formatIndexLine,
@@ -107,7 +107,7 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 	let paths: MemoryPaths = resolvePaths(cwd, config);
 
 	let paused = false;
-	let enabled = true;
+	let enabled = config.enabled;
 	/** Session-stable memory prompt snapshot (Claude Code builds it once per session). */
 	let memoryPromptSnapshot = "";
 	const recallSession = new RecallSession();
@@ -116,9 +116,10 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 	let directWriteSinceExtract = false;
 	let sessionId = uuidv7();
 	const jobs = new MemoryJobs();
+	const dream = new DreamRunner(jobs);
 	let generation = 0;
 	let parentSystemPrompt: string | undefined;
-	const invalidateJobs = () => { generation++; jobs.cancel(); };
+	const invalidateJobs = () => { generation++; dream.cancel(); jobs.cancel(); };
 	pi.on("session_before_switch", invalidateJobs);
 	pi.on("session_before_fork", invalidateJobs);
 	pi.on("session_before_tree", invalidateJobs);
@@ -133,7 +134,24 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 
 	const statusText = () => {
 		const files = listMemories(paths).length;
-		return `memory: ${files} file${files === 1 ? "" : "s"}${paused ? " · paused" : ""}`;
+		return `memory: ${files} file${files === 1 ? "" : "s"}${!enabled ? " · off" : paused ? " · paused" : ""}`;
+	};
+
+	const syncActiveTools = () => {
+		const active = pi.getActiveTools();
+		pi.setActiveTools(enabled ? [...new Set([...active, "memory_save"])] : active.filter((name) => name !== "memory_save"));
+	};
+	const changeSwitches = async (changes: Partial<MemorySwitches>, ctx: ExtensionContext) => {
+		const currentConfig = config;
+		try { await saveMemorySwitches(cwd, changes); }
+		catch (error) { ctx.ui.notify(`Memory settings were not saved: ${error instanceof Error ? error.message : String(error)}`, "warning"); return; }
+		if (currentConfig !== config) return;
+		invalidateJobs();
+		Object.assign(config, changes);
+		enabled = config.enabled;
+		syncActiveTools();
+		setStatus(ctx, statusText());
+		ctx.ui.notify("Memory settings saved for this project.", "info");
 	};
 
 	/**
@@ -178,7 +196,7 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 
 	/** Run the gated extraction flow; returns a human-readable result line. */
 	const runExtraction = async (ctx: ExtensionContext, force: boolean): Promise<string> => {
-		if (!enabled || paused) return paused ? PAUSED_MESSAGE : "Memory is disabled for this session.";
+		if (!enabled || paused) return paused ? PAUSED_MESSAGE : "Memory is disabled for this project.";
 		const branch = ctx.sessionManager.buildContextEntries();
 		const { views, lastEntryId } = collectEntriesSince(branch, lastExtractedId);
 		const recent = views.length > 0 ? views : force ? collectEntriesSince(branch, null).views.slice(-10) : [];
@@ -223,11 +241,35 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 		}
 	};
 
+	const runDream = async (ctx: ExtensionContext, automatic: boolean): Promise<string | null> => {
+		if (!enabled || paused) return automatic ? null : paused ? PAUSED_MESSAGE : "Memory is disabled for this project.";
+		const startedGeneration = generation;
+		setStatus(ctx, "memory: consolidating…");
+		const result = await dream.run(ctx, {
+			automatic, paths, sessionId,
+			systemPrompt: (parentSystemPrompt ?? ctx.getSystemPrompt()) + "\n\n" + buildMemoryPromptSection(paths, config.citeMemories),
+		});
+		if (startedGeneration !== generation) return automatic ? null : `Dream cancelled after session state changed; ${result.status === "skipped" ? 0 : result.applied} operation(s) already applied`;
+		setStatus(ctx, statusText());
+		if (result.status === "skipped") return null;
+		if (result.applied > 0) pi.appendEntry("pi-memory:dream", { written: result.written, status: result.status });
+		return `Dream ${result.status}: ${result.applied} operation(s)${result.errors.length ? `; ${result.errors.join("; ")}` : ""}`;
+	};
+
+	const runManualDream = async (ctx: ExtensionCommandContext) => {
+		const startedGeneration = generation;
+		await ctx.waitForIdle();
+		if (startedGeneration !== generation) { ctx.ui.notify("Dream cancelled after session state changed.", "info"); return; }
+		ctx.ui.notify((await runDream(ctx, false)) ?? "Dream skipped.", "info");
+	};
+
 	pi.on("session_start", async (_event, ctx) => {
 		invalidateJobs();
 		parentSystemPrompt = undefined;
 		cwd = ctx.cwd;
 		config = loadConfig(cwd);
+		enabled = config.enabled;
+		syncActiveTools();
 		paths = resolvePaths(cwd, config);
 		ensureDirs(paths);
 		const legacy = legacyMemoryDir(cwd, paths);
@@ -243,47 +285,7 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 		snapshotMemoryPrompt();
 		debug("session_start: snapshot chars:", memoryPromptSnapshot.length, "cursor:", lastExtractedId);
 		setStatus(ctx, statusText());
-		// R29: nudge toward a dream when Claude Code's auto-dream conditions
-		// hold (>= 24h since the last dream and >= 5 sessions) — as a notice,
-		// not an ambient task.
-		void maybeNudgeDream(ctx);
 	});
-	// Session names changed after the last dream — iEt's "Sessions since last
-	// consolidation" list (m0354:107132).
-	const dreamSessionList = async (): Promise<string[]> => {
-		try {
-			const { SessionManager } = await import("@earendil-works/pi-coding-agent");
-			const sessions = await SessionManager.list(cwd);
-			const since = dreamTimestamp();
-			return sessions
-				.filter((s) => s.modified.getTime() > since)
-				.sort((a, b) => a.modified.getTime() - b.modified.getTime())
-				.map((s) => s.name ?? ((s.firstMessage || "").slice(0, 80) || s.id));
-		} catch {
-			return [];
-		}
-	};
-
-	const maybeNudgeDream = async (ctx: ExtensionContext) => {
-		try {
-			const { SessionManager } = await import("@earendil-works/pi-coding-agent");
-			const sessions = await SessionManager.list(cwd);
-			const lastDream = dreamTimestamp();
-			if (sessions.length >= 5 && Date.now() - lastDream > 24 * 3600_000) {
-				setStatus(ctx, "memory: due for /dream");
-				debug("dream nudge: sessions", sessions.length, "last dream", new Date(lastDream).toISOString());
-			}
-		} catch (error) {
-			debug("dream nudge skipped:", error instanceof Error ? error.message : String(error));
-		}
-	};
-
-	const dreamTimestamp = (): number => {
-		// Best effort: mtime of the most recently modified memory file; a
-		// directory that has not changed in a day is due for consolidation.
-		const memories = listMemories(paths);
-		return memories.length > 0 ? Math.max(...memories.map((m) => m.mtimeMs)) : 0;
-	};
 
 	pi.on("session_tree", async (_event, ctx) => {
 		invalidateJobs();
@@ -392,31 +394,33 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 		});
 	});
 
-	// Claude Code coalesces overlapping extractor runs into one trailing run
-	// (tengu_extract_memories_coalesced); pi can fire agent_settled while an
-	// extraction still awaits the model, so mirror that here.
-	let extractionInFlight = false;
-	let extractionPending = false;
-	pi.on("agent_settled", async (_event, ctx) => {
-		if (!enabled || !config.autoExtract || paused) return;
-		if (extractionInFlight) { extractionPending = true; return; }
-		extractionInFlight = true;
-		let result = "";
-		const startedGeneration = generation;
+	// Pi awaits settled hooks. Coalesce overlapping events and serialize Dream
+	// after extraction so the two workflows never compete for the model slot.
+	let settledInFlight = false;
+	let pendingContext: ExtensionContext | undefined;
+	const settleMemory = async (ctx: ExtensionContext) => {
+		if (!enabled || paused || (!config.autoExtract && !config.autoDream)) return;
+		if (settledInFlight) { pendingContext = ctx; return; }
+		settledInFlight = true;
 		try {
-			do {
-				extractionPending = false;
-				result = await runExtraction(ctx, false);
-			} while (extractionPending && startedGeneration === generation && enabled && !paused && config.autoExtract);
-		} finally {
-			extractionInFlight = false;
-		}
-		// Surface the outcome (or the skip reason) so a silent no-op is never
-		// mistaken for a completed extraction.
-		if (startedGeneration === generation && ctx.hasUI && !result.startsWith("skipped: no new messages")) {
-			ctx.ui.notify(`pi-memory: ${result}`, "info");
-		}
-	});
+			let next: ExtensionContext | undefined = ctx;
+			while (next) {
+				const current = next;
+				pendingContext = undefined;
+				const startedGeneration = generation;
+				if (enabled && !paused && config.autoExtract) {
+					const result = await runExtraction(current, false);
+					if (startedGeneration === generation && current.hasUI && !result.startsWith("skipped: no new messages")) current.ui.notify(`pi-memory: ${result}`, "info");
+				}
+				if (startedGeneration === generation && !pendingContext && enabled && !paused && config.autoDream) {
+					const result = await runDream(current, true);
+					if (result && current.hasUI) current.ui.notify(result, "info");
+				}
+				next = pendingContext;
+			}
+		} finally { settledInFlight = false; }
+	};
+	pi.on("agent_settled", async (_event, ctx) => settleMemory(ctx));
 
 	// TUI feedback line for persisted extraction entries (Claude Code shows
 	// "saved N memories" in the collapsed transcript rows).
@@ -522,8 +526,15 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 	pi.registerCommand("memory", {
 		description: "Open the pi-memory panel (stats, pause, extract, dream)",
 		handler: async (args, ctx) => {
+			const setting = /^(on|off|auto-extract (?:on|off)|auto-dream (?:on|off))$/.exec(args.trim());
+			if (setting) {
+				const value = setting[0].endsWith("on");
+				const key: keyof MemorySwitches = setting[0].startsWith("auto-extract") ? "autoExtract" : setting[0].startsWith("auto-dream") ? "autoDream" : "enabled";
+				await changeSwitches({ [key]: value }, ctx);
+				return;
+			}
 			if (args.trim() === "import-legacy") {
-				if (!enabled || paused) { ctx.ui.notify(paused ? PAUSED_MESSAGE : "Memory is disabled for this session.", "warning"); return; }
+				if (!enabled || paused) { ctx.ui.notify(paused ? PAUSED_MESSAGE : "Memory is disabled for this project.", "warning"); return; }
 				const legacy = legacyMemoryDir(cwd, paths);
 				const files = listMemories({ ...paths, personalDir: legacy, teamDir: null });
 				let imported = 0;
@@ -533,17 +544,22 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 					const result = await mutateMemory(paths, { kind: "upsert", ref: file.ref, content }, new Map([[file.ref, null]]));
 					if (result.ok) imported++;
 				}
+				if (imported > 0) recordDirectWrite();
 				ctx.ui.notify(`Imported ${imported} of ${files.length} legacy memories. Existing targets and all legacy files were preserved.`, "info");
 				return;
 			}
 			const memories = listMemories(paths);
 			const index = readIndex(paths);
+			let lastDream: string;
+			try { const state = readDreamState(paths); lastDream = state.lastCompletedAt === null ? "never" : new Date(state.lastCompletedAt).toISOString(); }
+			catch (error) { lastDream = `unavailable (${error instanceof Error ? error.message : String(error)})`; }
 			const summary = [
 				`Memory dir: ${paths.personalDir}`,
 				paths.teamDir ? `Team dir:   ${paths.teamDir}` : null,
 				`Memories:   ${memories.length} file(s), ${memories.filter((m) => m.pinned).length} pinned`,
 				`Index:      ${index.lineCount} line(s) → ${indexPath(paths)}`,
 				`Auto-extract: ${config.autoExtract ? "on" : "off"} · Recall: ${config.recall ? "on" : "off"} · Paused: ${paused ? "yes" : "no"}`,
+				`Enabled: ${enabled ? "yes" : "no"} · Auto-dream: ${config.autoDream ? "on" : "off"} · Last successful Dream: ${lastDream}`,
 			]
 				.filter(Boolean)
 				.join("\n");
@@ -551,20 +567,19 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 				ctx.ui.notify(summary, "info");
 				return;
 			}
-		// CC /memory (m1646): "Open auto-memory folder" + "Open team memory folder"
-		// when team memory is on; org-store and CLAUDE.md rows are documented
-		// omissions (pi loads AGENTS.md natively, no enterprise stores).
-		const items = [
-			`Toggle pause (${paused ? "resume" : "pause"} memory for this session)`,
-			"Extract memories from this session now",
-			"Run a dream (memory consolidation)",
-			"Toggle background auto-extract",
-			`Turn pi-memory ${enabled ? "off" : "on"} for this session`,
-			"Open memory folder",
-			...(paths.teamDir ? ["Open team memory folder"] : []),
-			"Close",
-		];
-		const choice = await ctx.ui.select("pi-memory", items);
+			// Pi owns AGENTS.md loading; remote organization stores are out of scope.
+			const items = [
+				`Toggle pause (${paused ? "resume" : "pause"} memory for this session)`,
+				"Extract memories from this session now",
+				"Run a dream (memory consolidation)",
+				"Toggle background auto-extract",
+				"Toggle automatic Dream",
+				`Turn pi-memory ${enabled ? "off" : "on"} for this project`,
+				"Open memory folder",
+				...(paths.teamDir ? ["Open team memory folder"] : []),
+				"Close",
+			];
+			const choice = await ctx.ui.select(summary, items);
 			switch (choice) {
 				case `Toggle pause (${paused ? "resume" : "pause"} memory for this session)`:
 					paused = !paused;
@@ -581,31 +596,16 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 					ctx.ui.notify(await runExtraction(ctx, true), "info");
 					break;
 				case "Run a dream (memory consolidation)":
-					if (!enabled || paused) { ctx.ui.notify(paused ? PAUSED_MESSAGE : "Memory is disabled for this session.", "warning"); break; }
-					pi.sendUserMessage(buildDreamPrompt(paths, pathJoin(getAgentDir(), "sessions"), await dreamSessionList()));
+					await runManualDream(ctx);
 					break;
 				case "Toggle background auto-extract":
-					config.autoExtract = !config.autoExtract;
-					ctx.ui.notify(`Background auto-extract ${config.autoExtract ? "enabled" : "disabled"}.`, "info");
+					await changeSwitches({ autoExtract: !config.autoExtract }, ctx);
 					break;
-				case `Turn pi-memory ${enabled ? "off" : "on"} for this session`:
-					enabled = !enabled;
-					invalidateJobs();
-					// Drop memory_save from the active tool set when disabled so
-					// the model never sees it (execute() still guards as backup).
-					{
-						const active = pi.getActiveTools();
-						pi.setActiveTools(
-							enabled
-								? [...new Set([...active, "memory_save"])]
-								: active.filter((name) => name !== "memory_save"),
-						);
-					}
-					ctx.ui.notify(
-						`pi-memory ${enabled ? "enabled" : "disabled"} for this session` +
-							(enabled ? "." : " (fully inert: no prompt, no recall, no extraction, no gating)."),
-						"info",
-					);
+				case "Toggle automatic Dream":
+					await changeSwitches({ autoDream: !config.autoDream }, ctx);
+					break;
+				case `Turn pi-memory ${enabled ? "off" : "on"} for this project`:
+					await changeSwitches({ enabled: !enabled }, ctx);
 					break;
 				case "Open memory folder":
 					await openFolder(pi, ctx, paths.personalDir);
@@ -655,7 +655,7 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 			return filtered.length > 0 ? filtered : items.length > 0 ? items : null;
 		},
 		handler: async (args, ctx) => {
-			if (!enabled || paused) { ctx.ui.notify(paused ? PAUSED_MESSAGE : "Memory is disabled for this session.", "warning"); return; }
+			if (!enabled || paused) { ctx.ui.notify(paused ? PAUSED_MESSAGE : "Memory is disabled for this project.", "warning"); return; }
 			if (!paths.teamDir) {
 				ctx.ui.notify("Shared (team) memory is not enabled — set sharedMemory: true in .pi/memory.json first.", "warning");
 				return;
@@ -667,6 +667,7 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 			}
 			const promoted = await mutateMemory(paths, { kind: "promote", ref });
 			if (!promoted.ok) { ctx.ui.notify(promoted.error, "warning"); return; }
+			recordDirectWrite();
 			ctx.ui.notify(`Promoted ${ref} to team memory (team/${ref}).`, "info");
 		},
 	});
@@ -674,12 +675,7 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 	pi.registerCommand("dream", {
 		description: "Run a memory-consolidation dream over your memory files",
 		handler: async (_args, ctx) => {
-			if (!enabled || paused) {
-				ctx.ui.notify(paused ? PAUSED_MESSAGE : "Memory is disabled for this session.", "warning");
-				return;
-			}
-			await ctx.waitForIdle();
-			pi.sendUserMessage(buildDreamPrompt(paths, pathJoin(getAgentDir(), "sessions"), await dreamSessionList()));
+			await runManualDream(ctx);
 		},
 	});
 }

@@ -1,7 +1,7 @@
 {
   "name": "pi-memory",
   "version": "0.3.0",
-  "description": "Claude Code-style auto memory for pi: file-based memories with a MEMORY.md index, pinned memories, recall injection, sandboxed background extraction, dream consolidation, /memory and /pause-memory commands.",
+  "description": "Claude Code-style auto memory for pi: file-based memories with a MEMORY.md index, pinned memories, recall injection, restricted automatic extraction, dream consolidation, /memory and /pause-memory commands.",
   "type": "module",
   "pi": {
     "extensions": [
@@ -13,21 +13,25 @@
     "test": "node --import jiti/register --test test/regressions.test.ts && node --import jiti/register test/e2e-acceptance.ts"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "0.85.1",
     "@earendil-works/pi-ai": "0.85.1",
+    "@earendil-works/pi-coding-agent": "0.85.1",
     "@earendil-works/pi-tui": "0.85.1",
+    "@types/node": "22.19.19",
+    "@types/proper-lockfile": "4.1.4",
     "jiti": "2.7.0",
     "typebox": "1.3.7",
-    "@types/node": "22.19.19",
     "typescript": "5.9.3"
   },
   "engines": {
     "node": ">=22.19.0"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=0.84.2 <0.86",
     "@earendil-works/pi-ai": ">=0.84.2 <0.86",
+    "@earendil-works/pi-coding-agent": ">=0.84.2 <0.86",
     "@earendil-works/pi-tui": ">=0.84.2 <0.86",
     "typebox": "*"
+  },
+  "dependencies": {
+    "proper-lockfile": "4.1.2"
   }
 }

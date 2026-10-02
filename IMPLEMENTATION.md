@@ -26,13 +26,14 @@ Enterprise services, paid semantic retrieval, replacing pi's instruction loader,
 | Recall state and freshness | Complete | 22 behavior regressions and cleaned lifecycle acceptance pass; real session branches/compaction drive recall restoration; freshness preserves the system prefix |
 | npm toolchain | Complete | Locked pi 0.85.1 development dependencies; Node runner with pi's Jiti dependency; npm check and both test suites pass |
 | Extraction workflow | Complete | 30 behavior regressions plus lifecycle acceptance; complete-body reads, parent context, stale-write rejection, cancellation, reload cursors, and sequential operations verified through public commands/events |
-| Dream lifecycle and settings | Pending | Share the model/mutation boundary with extraction |
-| Final audit and documentation | Pending | Audit every acceptance item against tests and final code |
+| Dream lifecycle and settings | Complete | 44 behavior regressions plus lifecycle acceptance pass; persisted switches, bounded session/evidence input, completion state, scheduling, cancellation, and cross-process ownership verified |
+| Final audit and documentation | Complete | Acceptance audit below; strict/no-unused TypeScript checks, diff checks, dependency inspection, and local package preview passed; README and PORT-MATRIX match the implementation |
 
 ## Ownership and decisions
 
 - `config.ts` owns project identity and resolved configuration; `store.ts` owns memory/index persistence and path containment.
 - `recall.ts` owns relevance and surfaced-memory state. Session wiring stays in `index.ts`; `workflow.ts` owns bounded model execution and cancellation, reusing pi's model registry and file mutation queue.
+- `dream.ts` owns scheduling, session sampling, and completion state. `persistence.ts` owns atomic project-switch updates and process-shared state locks; it does not lock independent foreground memory edits.
 - Reuse the current validated operation protocol for extraction and Dream instead of starting an unrestricted secondary pi process. This keeps allowed effects explicit and makes cancellation/conflict behavior testable. Add bounded reads of existing memory where needed; no shell execution in memory jobs.
 - Preserve existing legacy basename directories. New canonical-path identities prevent cross-project mixing; any legacy import must be deliberate and conflict-safe.
 - File and index replacement can be atomic individually on the local filesystem. Multi-file persistence needs preflight, rollback on ordinary failures, and an explicit crash-recovery story; do not claim cross-file atomicity.
@@ -49,17 +50,17 @@ Enterprise services, paid semantic retrieval, replacing pi's instruction loader,
 
 ## Verification log
 
-Commands: `npm run check`, `npm test`, `tsc -p tsconfig.json --noUnusedLocals --noUnusedParameters`, `git diff --check`.
+Commands: `npm run check`, `npm test`, `npx tsc -p tsconfig.json --noUnusedLocals --noUnusedParameters`, `git diff --check`, `npm ls --depth=0`, `npm pack --dry-run --json`.
 
 First implementation milestone: 14 regression tests pass plus the original E2E acceptance script. Added real SessionManager compaction, parallel saves, pi builtin writes, path alias containment, conflict-safe promotion, explicit legacy import, and junction escape checks. Nine core cases failed against the initial code. All tests use temporary roots and mocked model completion.
 
 `mutateMemory` now owns structured persistence. Sorted per-file queues prevent same-process interleaving; ordinary failures restore original bytes. Crash atomicity across several files and independent-process serialization are not claimed. The README records those limits.
 
-Portable npm scripts and dev dependency declarations replace the machine-specific typeRoots path. In this environment `node_modules/@types` links to the existing matching pi workspace's types; the dependency directory remains ignored.
+Portable npm scripts and dev dependency declarations replace the machine-specific typeRoots path. Dependencies now use a standalone npm installation; no workspace type symlink is required.
 
-## Next action
+## Completion and continuation
 
-Implement manual/automatic Dream and persisted settings on the bounded shared workflow. Reuse pi's SessionManager to load transcripts and public model/context/queue/lifecycle APIs. Do not reintroduce prompt or diagnostic wording tests. Use npm for all repository commands.
+The daily-use acceptance requirements below are complete. Future changes should start from the owners and verified behavior recorded here and the intentional differences in PORT-MATRIX.md. Use npm, reuse Pi's public host APIs, and keep tests focused on observable behavior and data preservation.
 
 ## Recall milestone evidence and user constraints
 
@@ -76,3 +77,30 @@ The workflow uses pi's `modelRegistry.complete`, `getSystemPrompt`, `buildContex
 Pause, disable, foreground turns, compaction, branch/fork/switch, and shutdown cancel jobs. A provider that ignores cancellation can finish later, but its response is discarded. Queued mutations check the signal before effects. A cancelled/failed batch may retain earlier committed operations; only fully completed extraction advances its cursor. Model session identifiers are isolated from the foreground conversation.
 
 Verification: npm run check, npm test (30 regressions plus lifecycle acceptance), no-unused TypeScript checks, and git diff --check pass. Tests validate inherited context/data delivery, read-before-update enforcement, concurrent file preservation, cancellation, cursor restoration, and multi-operation persistence. No prompt wording assertions were added.
+
+## Dream milestone decisions
+
+`dream.ts` owns scheduling, bounded recent-session input, and a versioned completion record in personal memory. Successful no-op runs count as consolidation; failed, partial, and cancelled runs do not. The consumed timestamp is the start of a successful run so later session changes remain eligible. Successful sampling also consumes older omitted sessions. Automatic runs require elapsed time and new sessions; retries are throttled. Manual runs bypass cadence, not cancellation or locking.
+
+The project switches `enabled`, `autoExtract`, and opt-in `autoDream` persist in `.pi/memory.json`; branch pause remains session metadata. `persistence.ts` uses Pi's per-file queue for settings and proper-lockfile (the library Pi uses internally) for cross-process state ownership. Existing unknown settings are preserved, and malformed settings are not overwritten. Dream reuses the existing restricted operation protocol, model registry, and mutation owner. Pi's settled hook awaits the work; this is not a detached daemon.
+
+`/dream` runs through `MemoryJobs` outside the foreground transcript. `DreamRunner` reads live and saved contexts through Pi `SessionManager`, records attempts and completed runs under a process-shared lock, and cancels preflight as well as model work. Project evidence reads delegate to Pi `createReadTool` after canonical containment and file-size checks. Source writes and shell access remain unavailable.
+
+Settings commands and the panel persist project switches, preserve unrelated fields, and keep running state unchanged when saving fails. Settled events serialize extraction then opt-in Dream, including when extraction is disabled. Panel completion dates come from the state record. Promotion/import now invalidate older model jobs after a successful write.
+
+Final verification: npm run check and npm test pass (44 behavior regressions plus lifecycle acceptance). The no-unused TypeScript check passes. Dependency inspection resolves the standalone npm installation. The local package preview includes the new runtime modules and excludes hidden directories and temporary dependency backups. Git ignore checks cover root and nested dot-prefixed directories.
+
+## Acceptance audit
+
+| Requirement | Implementation and verified behavior |
+| --- | --- |
+| Project isolation and legacy preservation | Canonical project identity isolates same-basename roots; explicit import preserves source files and destination conflicts. |
+| Extraction windows and branch state | Real Pi session compaction, reload, and branch changes verify cursor recovery, direct-write consumption, and branch-local pause. Explicit and automatic paths honor pause/disable. |
+| Shared mutation ownership | Structured operations use `mutateMemory`; concurrent pin saves enforce capacity, rejected index updates preserve existing data, promotion preserves conflicts, and sequential batches see earlier committed writes. |
+| Pi path semantics and boundaries | Builtin write aliases resolve consistently for pause and provenance; sibling directories remain accessible and escaping directory links are rejected. |
+| Recall state and freshness | Visible session attachments restore deduplication/budgets; compaction restores eligibility; changed/deleted memories update context while the system prefix stays fixed. Internal Dream turns skip recall. |
+| Complete extraction input and cancellation | Generated payloads verify inherited context and complete old-body delivery. Unread/stale updates are rejected, late responses cannot write after cancellation, and queued cancellation preserves earlier committed operations. |
+| Dream lifecycle | Active/saved Pi contexts and native project reads supply evidence; no-op success advances completion, partial/failure/cancellation do not. Thresholds, retry/completion intervals, preflight cancellation, idle/session replacement, and a second Node process exercise scheduling and ownership. |
+| Persisted settings and delivery | Reload restores project switches, unrelated fields survive, and malformed files leave disk/runtime state intact. Commands, panel, README, and PORT-MATRIX describe the implemented outcomes. |
+
+Tests use temporary projects, real Pi session infrastructure, and a mocked model boundary. They verify lifecycle and data flow, not live-model memory quality or execution inside the original Claude Code binary. Verification ran on Windows with Pi 0.85.1. Multi-file crash atomicity and cross-process serialization of all memory edits remain documented limits.

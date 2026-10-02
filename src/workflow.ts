@@ -3,17 +3,21 @@
  * contract, so this module owns the small turn loop and cancellation boundary.
  */
 import { uuidv7, type Message } from "@earendil-works/pi-ai";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { createReadTool, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { LIMITS, type MemoryPaths } from "./config.js";
 import { applyExtractOps, parseExtractResponse } from "./extract.js";
-import { isValidFileRef, memoryPath, readFileOrNull } from "./store.js";
+import { containsPath, isValidFileRef, memoryPath, readFileOrNull } from "./store.js";
 
+// Keep README.md Behavior and guarantees aligned with these execution bounds.
 const MAX_TURNS = 5;
 const MAX_CONTEXT_BYTES = 160_000;
 const MAX_READ_BYTES = 32_000;
 const MAX_OUTPUT_TOKENS = 4096;
 const MAX_RESPONSE_BYTES = 32_000;
 const TIMEOUT_MS = 60_000;
+const MAX_PROJECT_FILE_BYTES = 1_000_000;
 
 export interface MemoryJobRequest {
 	readonly kind: "extract" | "dream";
@@ -21,6 +25,7 @@ export interface MemoryJobRequest {
 	readonly sessionId: string;
 	readonly systemPrompt: string;
 	readonly prompt: string;
+	readonly signal?: AbortSignal;
 }
 
 export interface MemoryJobResult {
@@ -40,7 +45,10 @@ export class MemoryJobs {
 		if (this.active) return { status: "busy", written: [], applied: 0, errors: [] };
 		const controller = new AbortController();
 		this.active = controller;
-		const signal = ctx.signal ? AbortSignal.any([controller.signal, ctx.signal]) : controller.signal;
+		const signals = [controller.signal];
+		if (ctx.signal) signals.push(ctx.signal);
+		if (request.signal) signals.push(request.signal);
+		const signal = AbortSignal.any(signals);
 		const timeout = setTimeout(() => controller.abort(new Error("Memory job timed out")), TIMEOUT_MS);
 		try {
 			return await execute(ctx, request, signal);
@@ -63,14 +71,14 @@ async function execute(ctx: ExtensionContext, request: MemoryJobRequest, signal:
 	const messages: Message[] = [{ role: "user", content: request.prompt, timestamp: Date.now() }];
 	const systemPrompt = request.systemPrompt +
 		`\n\nThis is a restricted memory job. Return only JSON, either {"read":["memory.md"]} or {"ops":[...]}. ` +
-		`Use at most ${LIMITS.extractMaxOps} reads or operations per response. Reads return complete files; oversized files cannot be edited. ` +
+		`Use at most ${LIMITS.extractMaxOps} reads or operations per response. Memory reads return complete files; oversized memories cannot be edited. Project reads use Pi's output truncation. ` +
 		"Read existing files before changing them. Omit pinned to preserve its current value. Never run commands or write source files. " +
-		(request.kind === "dream" ? "Do not create team memories or promote personal content into team memory. " : "");
+		(request.kind === "dream" ? 'You may also request {"readProject":["relative/path"]} to inspect current source. Do not create team memories or promote personal content into team memory. ' : "");
 	for (let turn = 0; turn < MAX_TURNS; turn++) {
 		signal.throwIfAborted();
 		if (Buffer.byteLength(systemPrompt + JSON.stringify(messages), "utf8") > MAX_CONTEXT_BYTES)
 			throw new Error("Memory job context exceeds its bound; no further operations were applied");
-		const response = await abortable(ctx.modelRegistry.complete(ctx.model, { systemPrompt, messages }, {
+		const response = await awaitWithAbort(ctx.modelRegistry.complete(ctx.model, { systemPrompt, messages }, {
 			signal, maxTokens: MAX_OUTPUT_TOKENS, sessionId: modelSessionId, cacheRetention: "none",
 		}), signal);
 		signal.throwIfAborted();
@@ -81,6 +89,26 @@ async function execute(ctx: ExtensionContext, request: MemoryJobRequest, signal:
 		const reply = parseExtractResponse(text);
 		if (!reply) throw new Error("Memory model returned an invalid operation response");
 		messages.push(response);
+		if (reply.kind === "readProject") {
+			if (request.kind !== "dream") throw new Error("Project reads are only available during Dream");
+			if (!reply.files.length || reply.files.length > LIMITS.extractMaxOps) throw new Error("Project read request exceeds its file bound");
+			const root = fs.realpathSync(ctx.cwd);
+			const reader = createReadTool(root);
+			const files: { path: string; content: string }[] = [];
+			for (const file of reply.files) {
+				signal.throwIfAborted();
+				if (path.isAbsolute(file)) throw new Error("Project reads require relative paths");
+				const absolute = fs.realpathSync(path.resolve(root, file));
+				if (!containsPath(root, absolute)) throw new Error("Project read is outside the current project");
+				const stat = fs.statSync(absolute);
+				if (!stat.isFile() || stat.size > MAX_PROJECT_FILE_BYTES) throw new Error("Project read requires a regular file within the byte bound");
+				const result = await awaitWithAbort(reader.execute(uuidv7(), { path: absolute }, signal), signal);
+				if (result.content.some((part) => part.type !== "text")) throw new Error("Project reads require text files");
+				files.push({ path: file, content: result.content.filter((part) => part.type === "text").map((part) => part.text).join("\n") });
+			}
+			messages.push({ role: "user", content: JSON.stringify({ files }), timestamp: Date.now() });
+			continue;
+		}
 		if (reply.kind === "read") {
 			if (!reply.files.length || reply.files.length > LIMITS.extractMaxOps) throw new Error("Memory read request exceeds its file bound");
 			const files = reply.files.map((ref) => {
@@ -118,7 +146,7 @@ async function execute(ctx: ExtensionContext, request: MemoryJobRequest, signal:
 }
 
 /** Bound caller wait even when a provider ignores AbortSignal; late output is discarded. */
-function abortable<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+export function awaitWithAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
 	return new Promise<T>((resolve, reject) => {
 		const abort = () => reject(signal.reason);
 		signal.addEventListener("abort", abort, { once: true });
