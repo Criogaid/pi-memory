@@ -157,9 +157,15 @@ export function truncateMemory(raw: string, absolutePath: string, maxBytes = LIM
 
 /** Longest prefix of `text` that fits in `maxBytes` UTF-8 bytes. */
 function sliceToByteLimit(text: string, maxBytes: number): string {
-	let end = text.length;
-	while (end > 0 && Buffer.byteLength(text.slice(0, end), "utf-8") > maxBytes) end--;
-	return text.slice(0, end);
+	// Byte length is monotonic in the prefix length, so binary search needs only O(log n) measurements on large files.
+	let low = 0;
+	let high = text.length;
+	while (low < high) {
+		const mid = Math.ceil((low + high) / 2);
+		if (Buffer.byteLength(text.slice(0, mid), "utf-8") <= maxBytes) low = mid;
+		else high = mid - 1;
+	}
+	return text.slice(0, low);
 }
 
 /**

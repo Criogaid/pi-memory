@@ -94,26 +94,23 @@ async function execute(ctx: ExtensionContext, request: MemoryJobRequest, signal:
 			if (!reply.files.length || reply.files.length > LIMITS.extractMaxOps) throw new Error("Project read request exceeds its file bound");
 			const root = fs.realpathSync(ctx.cwd);
 			const reader = createReadTool(root);
-			const files: { path: string; content: string }[] = [];
+			const files: ({ path: string; content: string } | { path: string; error: string })[] = [];
 			for (const file of reply.files) {
 				signal.throwIfAborted();
-				if (path.isAbsolute(file)) throw new Error("Project reads require relative paths");
-				const absolute = fs.realpathSync(path.resolve(root, file));
-				if (!containsPath(root, absolute)) throw new Error("Project read is outside the current project");
-				const stat = fs.statSync(absolute);
-				if (!stat.isFile() || stat.size > MAX_PROJECT_FILE_BYTES) throw new Error("Project read requires a regular file within the byte bound");
-				const result = await awaitWithAbort(reader.execute(uuidv7(), { path: absolute }, signal), signal);
-				if (result.content.some((part) => part.type !== "text")) throw new Error("Project reads require text files");
-				files.push({ path: file, content: result.content.filter((part) => part.type === "text").map((part) => part.text).join("\n") });
+				files.push({ path: file, ...await readProjectFile(root, reader, file, signal) });
 			}
 			messages.push({ role: "user", content: JSON.stringify({ files }), timestamp: Date.now() });
 			continue;
 		}
 		if (reply.kind === "read") {
 			if (!reply.files.length || reply.files.length > LIMITS.extractMaxOps) throw new Error("Memory read request exceeds its file bound");
+			// Unreadable references stay unobserved, so later operations on them are still refused.
 			const files = reply.files.map((ref) => {
-				if (!isValidFileRef(ref, request.paths.teamDir !== null)) throw new Error(`Invalid memory reference: ${ref}`);
-				const content = readFileOrNull(memoryPath(request.paths, ref));
+				if (!isValidFileRef(ref, request.paths.teamDir !== null)) return { ref, error: "Invalid memory reference; use a listed lowercase .md file" };
+				let target: string;
+				try { target = memoryPath(request.paths, ref); }
+				catch (error) { return { ref, error: error instanceof Error ? error.message : String(error) }; }
+				const content = readFileOrNull(target);
 				if (content !== null && Buffer.byteLength(content, "utf8") > MAX_READ_BYTES)
 					return { ref, error: "File exceeds the complete-read bound; do not modify it" };
 				observations.set(ref, content);
@@ -143,6 +140,28 @@ async function execute(ctx: ExtensionContext, request: MemoryJobRequest, signal:
 		return { status: result.skipped.length ? "partial" : "completed", written: result.written, applied: result.applied, errors: result.skipped };
 	}
 	throw new Error("Memory job reached its turn limit without completing operations");
+}
+
+/** Containment violations end the job; unreadable in-project targets are reported so one bad guess does not. */
+async function readProjectFile(root: string, reader: ReturnType<typeof createReadTool>, file: string, signal: AbortSignal): Promise<{ content: string } | { error: string }> {
+	if (path.isAbsolute(file)) throw new Error("Project reads require relative paths");
+	let absolute: string;
+	try { absolute = fs.realpathSync(path.resolve(root, file)); }
+	catch (error) {
+		if (!containsPath(root, path.resolve(root, file))) throw new Error("Project read is outside the current project");
+		if (isMissingPath(error)) return { error: "File not found in the current project" };
+		throw error;
+	}
+	if (!containsPath(root, absolute)) throw new Error("Project read is outside the current project");
+	const stat = fs.statSync(absolute);
+	if (!stat.isFile() || stat.size > MAX_PROJECT_FILE_BYTES) return { error: "Project read requires a regular file within the byte bound" };
+	const result = await awaitWithAbort(reader.execute(uuidv7(), { path: absolute }, signal), signal);
+	if (result.content.some((part) => part.type !== "text")) return { error: "Project reads require text files" };
+	return { content: result.content.filter((part) => part.type === "text").map((part) => part.text).join("\n") };
+}
+
+function isMissingPath(error: unknown): boolean {
+	return error instanceof Error && "code" in error && (error.code === "ENOENT" || error.code === "ENOTDIR");
 }
 
 /** Bound caller wait even when a provider ignores AbortSignal; late output is discarded. */

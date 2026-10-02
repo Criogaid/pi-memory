@@ -205,9 +205,13 @@ export function stampProvenance(raw: string, sessionId: string): string {
 	}
 	if (!refreshed) {
 		const idx = lines.findIndex((line) => /^\s*originSessionId\s*:/.test(line));
-		lines.splice(idx + 1, 0, `modified: ${now}`);
+		// Sibling indentation keeps a nested stamp inside metadata.
+		const indent = /^\s*/.exec(lines[idx])?.[0] ?? "";
+		lines.splice(idx + 1, 0, `${indent}modified: ${now}`);
 	}
-	return raw.replace(block, lines.join(eol));
+	// Splice by position: a string replacement would expand `$` patterns in the frontmatter.
+	const start = match[0].indexOf(block);
+	return raw.slice(0, start) + lines.join(eol) + raw.slice(start + block.length);
 }
 
 /** Provenance keys live in metadata (canonical); legacy root placement still reads. */
