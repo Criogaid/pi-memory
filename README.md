@@ -2,6 +2,10 @@
 
 File-based persistent memory for pi, adapted from the Claude Code 2.1.252 reference in `.references/claude-analysis/`. This extension stores individual Markdown memories, maintains a `MEMORY.md` index, injects relevant memories, and extracts durable facts after an agent turn.
 
+[![CI](https://github.com/Criogaid/pi-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/Criogaid/pi-memory/actions/workflows/ci.yml)
+
+The repository is `Criogaid/pi-memory`; the npm package name is `@criogaid/pi-memory`.
+
 ## Installation
 
 Install one copy, globally or in the project:
@@ -93,3 +97,11 @@ npm test
 ```
 
 The regression suite drives real Pi sessions with a mocked model boundary. It covers project isolation, extraction after direct writes/compaction, branch-aware pause and recall, save/promotion preservation, concurrent mutation, inherited context, Dream scheduling/cancellation, actual completion records, persistent settings, scoped project reads, and cross-process Dream ownership. The lifecycle acceptance script also runs. Tests check behavior and data preservation without pinning prompt text, UI labels, defaults, or diagnostic wording. No live model credentials or personal memory directories are required.
+
+## GitHub Actions and releases
+
+[CI](https://github.com/Criogaid/pi-memory/blob/main/.github/workflows/ci.yml) runs on pushes to `main`, pull requests, and manual dispatch. It installs the lockfile with npm, type-checks, and runs the regression and lifecycle acceptance suites on Linux, macOS, and Windows with Node.js 24. Linux also verifies the minimum supported Node.js 22.19.0 and Node.js 26. The Linux/Node.js 24 job previews the npm package contents.
+
+[Publish](https://github.com/Criogaid/pi-memory/blob/main/.github/workflows/publish.yml) runs only when a `v*` tag is pushed. It rejects a tag that differs from `package.json` or names a prerelease, then installs, checks, tests, and publishes `@criogaid/pi-memory` to npm with provenance. Configure the repository secret `NPM_TOKEN` with npm publish access to that scope before the first release. The workflow follows the token-based setup in `Criogaid/pi-hashline-edit`.
+
+Commit matching versions in `package.json` and `package-lock.json`, push to `main`, and wait for all CI jobs on that commit to pass before pushing its `v<version>` tag. Branch pushes never publish to npm. Both workflows pin external actions to reviewed commit SHAs; update the adjacent version comments with those pins.

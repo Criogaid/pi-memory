@@ -1,6 +1,13 @@
 # Ignore dot-prefixed directories at every depth.
 .*/
 
+# Track Actions definitions; keep other hidden directories ignored.
+!/.github/
+/.github/*
+!/.github/workflows/
+/.github/workflows/*
+!/.github/workflows/*.yml
+
 # Local dependencies and generated build output.
 node_modules/
 dist/

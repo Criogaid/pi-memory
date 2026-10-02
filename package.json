@@ -1,8 +1,22 @@
 {
-  "name": "pi-memory",
+  "name": "@criogaid/pi-memory",
   "version": "0.3.0",
   "description": "Claude Code-style auto memory for pi: file-based memories with a MEMORY.md index, pinned memories, recall injection, restricted automatic extraction, dream consolidation, /memory and /pause-memory commands.",
   "type": "module",
+  "homepage": "https://github.com/Criogaid/pi-memory#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Criogaid/pi-memory.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Criogaid/pi-memory/issues"
+  },
+  "keywords": ["pi-package", "pi", "memory"],
+  "files": ["src", "README.md", "PORT-MATRIX.md", "IMPLEMENTATION.md"],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  },
   "pi": {
     "extensions": [
       "./src/index.ts"

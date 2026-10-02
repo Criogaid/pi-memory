@@ -10,3 +10,5 @@
 - Update README and the parity matrix when changing observable behavior. Distinguish copied text/constants from verified end-to-end behavior.
 - Test observable state transitions, persistence, and data flow. Do not assert prompt prose, UI labels, error wording, fixed defaults, or serialization layout; vary payloads and verify their preservation where content delivery is the behavior.
 - Reuse pi's public session/context, model registry, mutation queue, and lifecycle APIs before adding infrastructure. Keep plugin-specific policy here; document a missing host capability before introducing a replacement.
+- Keep `.github/workflows/ci.yml` aligned with the npm checks and supported Node.js versions. Only `.github/workflows/*.yml` is exempt from the hidden-directory ignore rule.
+- Keep npm release ownership in `.github/workflows/publish.yml`; branch pushes run CI, while matching stable `v*` tags publish with provenance. Update README release instructions when changing that contract.

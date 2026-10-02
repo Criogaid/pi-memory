@@ -104,3 +104,11 @@ Final verification: npm run check and npm test pass (44 behavior regressions plu
 | Persisted settings and delivery | Reload restores project switches, unrelated fields survive, and malformed files leave disk/runtime state intact. Commands, panel, README, and PORT-MATRIX describe the implemented outcomes. |
 
 Tests use temporary projects, real Pi session infrastructure, and a mocked model boundary. They verify lifecycle and data flow, not live-model memory quality or execution inside the original Claude Code binary. Verification ran on Windows with Pi 0.85.1. Multi-file crash atomicity and cross-process serialization of all memory edits remain documented limits.
+
+## GitHub delivery
+
+Current work: create the public `Criogaid/pi-memory` repository and deliver npm-based Actions following `../pi-hashline-edit`. The reference repository is public with a `main` default branch. The unscoped npm name belongs to another author; the package uses `@criogaid/pi-memory`, while the plugin and repository retain the `pi-memory` name.
+
+CI runs the existing checks on Linux/macOS/Windows with Node.js 24 and on Linux with Node.js 22.19.0/26. Publish accepts matching stable version tags, repeats checks, and uses npm provenance with `NPM_TOKEN`. Actions are pinned to the inspected checkout v6.1.0 and setup-node v6.5.0 commits. Only workflow YAML files are exempted from the hidden-directory ignore rule. The package allowlist contains runtime sources and the linked user documentation; lockfile tarball URLs use the official npm registry without changing locked versions or integrity hashes.
+
+Local verification passed: clean `npm ci` from the official registry, `npm run check`, all 44 regression tests, lifecycle acceptance, package preview (15 runtime/documentation files), and Git diff/ignore checks. The release guard accepts the current matching tag and rejects a mismatched tag. No Actions linter is installed; hosted workflow recognition and matrix execution remain to be checked after pushing. No npm version tag or npm publication is part of this delivery.
