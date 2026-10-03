@@ -31,6 +31,7 @@ import {
 	serializeConversation,
 	truncateTail,
 	withFileMutationQueue,
+	type BuildSystemPromptOptions,
 	type ExtensionAPI,
 	type ExtensionContext,
 	type ExtensionCommandContext,
@@ -51,16 +52,18 @@ import {
 import { serializeMemory, slugName, stampProvenance } from "./frontmatter.js";
 import {
 	buildExtractionPrompt,
+	buildJobSystemPrompt,
 	checkExtractionGates,
 	collectEntriesSince,
 	containsSecret,
 	flattenIndexLine,
 	isDreamPrompt,
 	normalizeContent,
+	type ProjectInstructions,
 } from "./extract.js";
 import { buildIndexSection, buildMemoryPromptSection, buildPinnedSection } from "./prompt.js";
 import { RecallSession, recallForPrompt } from "./recall.js";
-import { MemoryJobs } from "./workflow.js";
+import { ForegroundPrefix, MemoryJobs } from "./workflow.js";
 import { DreamRunner } from "./dream.js";
 import { saveJobModel, saveMemorySwitches } from "./persistence.js";
 import { chooseJobModel, memoryPanelSummary, showMemoryPanel } from "./panel.js";
@@ -82,6 +85,8 @@ const PAUSED_MESSAGE = "Memory is paused. Run /pause-memory to resume automemory
 // memory-dir Read AND Write while paused ("will not write or read new memories").
 const MEMORY_TOOLS = new Set(["read", "write", "edit", "memory_save"]);
 const TRANSCRIPT_MAX_BYTES = 24_000;
+// Above this share of the context window, a fork may not fit the job's additions and replies.
+const FORK_MAX_CONTEXT_PERCENT = 90;
 // Minimal observability, mirroring Claude Code's n() debug logging for memory.
 const DEBUG = Boolean(process.env.PI_MEMORY_DEBUG?.trim());
 function debug(message: string, ...rest: unknown[]) {
@@ -119,9 +124,11 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 	let directWriteSinceExtract = false;
 	let sessionId = uuidv7();
 	const jobs = new MemoryJobs();
+	const foreground = new ForegroundPrefix();
 	const dream = new DreamRunner(jobs);
 	let generation = 0;
 	let parentSystemPrompt: string | undefined;
+	let projectInstructions: ProjectInstructions | undefined;
 	const invalidateJobs = () => { generation++; dream.cancel(); jobs.cancel(); };
 	pi.on("session_before_switch", invalidateJobs);
 	pi.on("session_before_fork", invalidateJobs);
@@ -200,6 +207,17 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 	};
 
 
+	/**
+	 * Memory jobs that run apart from the foreground conversation cannot reuse its prompt cache,
+	 * so they carry only the memory rules and Pi's project instructions instead of the whole
+	 * foreground prompt. Without Pi's prompt options (an unusual host), keep the inherited prompt.
+	 */
+	const jobSystemPrompt = (ctx: ExtensionContext | ExtensionCommandContext) => {
+		const rules = buildMemoryPromptSection(paths, config.citeMemories);
+		const project = "getSystemPromptOptions" in ctx ? captureProjectInstructions(ctx.getSystemPromptOptions()) : projectInstructions;
+		return project ? buildJobSystemPrompt(cwd, rules, project) : (parentSystemPrompt ?? ctx.getSystemPrompt()) + "\n\n" + rules;
+	};
+
 	/** pi's own compaction-style transcript for the extraction model call. */
 	const renderTranscript = (messages: Parameters<typeof convertToLlm>[0]): string => {
 		const serialized = serializeConversation(convertToLlm(messages));
@@ -248,12 +266,19 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 		}
 
 		const prompt = buildExtractionPrompt(paths, renderTranscript(recent.map((view) => view.message)), recent.length);
+		const usage = ctx.getContextUsage();
+		const settings = pi.getSettings();
+		const prefix = usage?.percent != null && usage.percent > FORK_MAX_CONTEXT_PERCENT ? undefined : foreground.fork(
+			{ sessionId: ctx.sessionManager.getSessionId(), thinkingBudgets: settings.thinkingBudgets },
+			settings.images?.blockImages === true,
+		);
 		const startedGeneration = generation;
 		setStatus(ctx, "memory: extracting…");
 		try {
 			const result = await jobs.run(ctx, {
 				kind: "extract", paths, sessionId, prompt, model: config.extractModel, sessionThinkingLevel: pi.getThinkingLevel(),
-				systemPrompt: (parentSystemPrompt ?? ctx.getSystemPrompt()) + "\n\n" + buildMemoryPromptSection(paths, config.citeMemories),
+				fork: prefix && { prefix, input: buildExtractionPrompt(paths, null, recent.length).input },
+				systemPrompt: jobSystemPrompt(ctx),
 			});
 			if (startedGeneration !== generation) return `extraction cancelled after session state changed; ${result.applied} operation(s) already applied`;
 			if (result.status === "completed") {
@@ -277,7 +302,7 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 		setStatus(ctx, "memory: consolidating…");
 		const result = await dream.run(ctx, {
 			automatic, paths, sessionId, model: config.dreamModel, sessionThinkingLevel: pi.getThinkingLevel(),
-			systemPrompt: (parentSystemPrompt ?? ctx.getSystemPrompt()) + "\n\n" + buildMemoryPromptSection(paths, config.citeMemories),
+			systemPrompt: jobSystemPrompt(ctx),
 		});
 		if (startedGeneration !== generation) return automatic ? null : `Dream cancelled after session state changed; ${result.status === "skipped" ? 0 : result.applied} operation(s) already applied`;
 		setStatus(ctx, statusText());
@@ -296,6 +321,8 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		invalidateJobs();
 		parentSystemPrompt = undefined;
+		projectInstructions = undefined;
+		foreground.reset();
 		cwd = ctx.cwd;
 		config = loadConfig(cwd);
 		enabled = config.enabled;
@@ -319,6 +346,7 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 
 	pi.on("session_tree", async (_event, ctx) => {
 		invalidateJobs();
+		foreground.reset();
 		restoreBranchState(ctx);
 		setStatus(ctx, statusText());
 	});
@@ -326,6 +354,7 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (event, ctx) => {
 		invalidateJobs();
 		parentSystemPrompt = event.systemPrompt;
+		projectInstructions = captureProjectInstructions(event.systemPromptOptions);
 		if (!enabled) return;
 		setStatus(ctx, statusText());
 
@@ -348,6 +377,10 @@ export default function piMemoryExtension(pi: ExtensionAPI) {
 			systemPrompt: event.systemPrompt + (memoryPromptSnapshot ? "\n\n" + memoryPromptSnapshot : ""),
 		};
 	});
+
+	// Observe-only: the last foreground request and its reply form the prefix an extraction can reuse.
+	pi.on("context_with_system", (event) => { foreground.observeRequest(event.messages); });
+	pi.on("message_end", (event) => { foreground.observeMessage(event.message); });
 
 	// Claude Code's `#` memory shortcut (u$t): a first line that is only "# …"
 	// (no prose after it on later lines) is an explicit remember-this request.
@@ -701,5 +734,13 @@ function toolError(message: string) {
 		content: [{ type: "text" as const, text: `Error: ${message}` }],
 		details: { error: message },
 		isError: true,
+	};
+}
+
+/** Copy, because Pi's prompt options are mutable and later handlers may edit them. */
+function captureProjectInstructions(options: BuildSystemPromptOptions): ProjectInstructions {
+	return {
+		contextFiles: (options.contextFiles ?? []).map(({ path, content }) => ({ path, content })),
+		appendSystemPrompt: options.appendSystemPrompt || undefined,
 	};
 }

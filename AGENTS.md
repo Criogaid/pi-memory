@@ -2,7 +2,7 @@
 
 - Read `IMPLEMENTATION.md` before continuing the active daily-use parity work; update its milestone status, verification evidence, and next action as work progresses.
 - Use `PORT-MATRIX.md` to locate reference behavior. Treat `.references/claude-analysis/report/` as analysis and verify disputed behavior in `pretty/` or `modules/`.
-- Keep project identity and switch metadata in `src/config.ts`, memory/index mutations and path containment in `src/store.ts`, recall selection/state in `src/recall.ts`, model operation parsing/prompts in `src/extract.ts`, bounded model execution/cancellation and Pi project reads in `src/workflow.ts`, Dream policy/session input/completion in `src/dream.ts`, native settings presentation in `src/panel.ts`, and state locking/settings writes in `src/persistence.ts`.
+- Keep project identity and switch metadata in `src/config.ts`, memory/index mutations and path containment in `src/store.ts`, recall selection/state in `src/recall.ts`, model operation parsing/prompts in `src/extract.ts`, bounded model execution/cancellation, foreground-prefix reuse, and Pi project reads in `src/workflow.ts`, Dream policy/session input/completion in `src/dream.ts`, native settings presentation in `src/panel.ts`, and state locking/settings writes in `src/persistence.ts`.
 - Route structured saves, extraction operations, and promotion through `mutateMemory`; do not write a second index-update path.
 - Preserve legacy basename directories. Import only through the explicit conflict-safe command; never infer which project owns a legacy directory.
 - Keep code comments focused on ownership, lifecycle, compatibility, and failure semantics. Record progress in `IMPLEMENTATION.md`, not comments.

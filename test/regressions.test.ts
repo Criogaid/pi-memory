@@ -5,8 +5,9 @@ import * as path from "node:path";
 import { after, test } from "node:test";
 import { fork } from "node:child_process";
 import { once } from "node:events";
-import { createEditTool, createWriteTool, initTheme, SessionManager, withFileMutationQueue, type ExtensionAPI, type ExtensionContext, type ExtensionToolContext, type ToolDefinition, type RegisteredCommand } from "@earendil-works/pi-coding-agent";
+import { convertToLlm, createEditTool, createWriteTool, initTheme, SessionManager, withFileMutationQueue, type ExtensionAPI, type ExtensionContext, type ExtensionToolContext, type ToolDefinition, type RegisteredCommand, type ContextWithSystemEvent } from "@earendil-works/pi-coding-agent";
 import { getKeybindings, type Component, type TUI } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
 import { setTimeout as delay } from "node:timers/promises";
 import type { BeforeAgentStartEventResult } from "@earendil-works/pi-coding-agent";
 import { getSupportedThinkingLevels, type Api, type AssistantMessage, type Context, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
@@ -33,7 +34,8 @@ type Handler = (event: unknown, ctx: ExtensionContext) => unknown | Promise<unkn
 interface Command { handler: (args: string, ctx: ExtensionContext) => unknown | Promise<unknown>; getArgumentCompletions?: RegisteredCommand["getArgumentCompletions"]; }
 type StreamOptions = Parameters<ExtensionContext["modelRegistry"]["streamSimple"]>[2];
 /** Thinking as sent; "off" is pi's omitted reasoning option. */
-interface ModelCall { readonly model: Model<Api>; readonly options: StreamOptions; readonly thinking: ModelThinkingLevel; }
+interface ModelCall { readonly model: Model<Api>; readonly context: Context; readonly options: StreamOptions; readonly thinking: ModelThinkingLevel; }
+type ModelReply = string | Partial<AssistantMessage>;
 
 async function withSession(run: (session: Awaited<ReturnType<typeof createSession>>) => Promise<void>) {
 	const session = await createSession();
@@ -55,13 +57,19 @@ async function createSession() {
 	const manager = SessionManager.create(cwd, path.join(root, "sessions"));
 	const notifications: string[] = [];
 	let modelCalls = 0;
-	let modelReply: (request: Context) => Promise<string> | string = () => '{"ops":[]}';
+	let modelReply: (request: Context) => Promise<ModelReply> | ModelReply = () => '{"ops":[]}';
 	let modelStopReason: AssistantMessage["stopReason"] = "stop";
 	const sessionModel = modelFixture();
 	const registeredModels = [{ model: sessionModel, authenticated: true }];
 	const modelRequests: ModelCall[] = [];
 	let sessionThinking: ModelThinkingLevel = "medium";
 	const parentRule = crypto.randomUUID();
+	// Prompt content Pi renders for the foreground agent only (tool and harness sections).
+	const foregroundOnly = crypto.randomUUID();
+	let appendSystemPrompt = "";
+	let contextUsage: ReturnType<ExtensionContext["getContextUsage"]>;
+	let settings: ReturnType<ExtensionAPI["getSettings"]> = {};
+	const promptOptions = () => ({ cwd, contextFiles: [{ path: path.join(cwd, "AGENTS.md"), content: parentRule }], appendSystemPrompt });
 	const config = loadConfig(cwd);
 	let activeTools = ["read", "write", "edit", "memory_save"];
 	let waitForIdle = async () => {};
@@ -85,11 +93,15 @@ async function createSession() {
 			getAvailable: () => registeredModels.filter((entry) => entry.authenticated).map((entry) => entry.model),
 			streamSimple: (model: Model<Api>, request: Context, options: StreamOptions) => {
 				modelCalls++;
-				modelRequests.push({ model, options: options && { ...options }, thinking: options?.reasoning ?? "off" });
-				return { result: async () => ({ ...assistantMessage(model, await modelReply(request)), stopReason: modelStopReason }) };
+				modelRequests.push({ model, context: structuredClone(request), options: options && { ...options }, thinking: options?.reasoning ?? "off" });
+				return { result: async () => {
+					const reply = await modelReply(request);
+					return typeof reply === "string" ? { ...assistantMessage(model, reply), stopReason: modelStopReason } : { ...assistantMessage(model, ""), ...reply };
+				} };
 			},
 		},
-		getSystemPrompt: () => parentRule,
+		getSystemPrompt: () => `${foregroundOnly}\n${parentRule}`,
+		getContextUsage: () => contextUsage,
 		ui: { notify: (text: string) => notifications.push(text), setStatus: () => {}, custom },
 		waitForIdle: () => waitForIdle(),
 	} as unknown as ExtensionContext;
@@ -102,13 +114,15 @@ async function createSession() {
 		getActiveTools: () => activeTools,
 		setActiveTools: (names: string[]) => { activeTools = names; }, sendUserMessage: () => {},
 		getThinkingLevel: () => sessionThinking,
+		getSettings: () => structuredClone(settings),
 	} as unknown as ExtensionAPI;
 	factory(api);
 	const emit = async (name: string, event: unknown = {}) => handlers.get(name)?.(event, ctx);
 	const command = async (name: string, args = "") => {
 		const item = commands.get(name);
 		assert.ok(item, `Command is registered: ${name}`);
-		return item.handler(args, ctx);
+		// Pi adds prompt options only to command contexts; event handlers see the base context.
+		return item.handler(args, { ...ctx, getSystemPromptOptions: promptOptions } as ExtensionContext);
 	};
 	const save = async (name: string, extra: Record<string, unknown> = {}) => {
 		const tool = tools.get("memory_save");
@@ -121,13 +135,26 @@ async function createSession() {
 	};
 	const turn = async (prompt: string) => {
 		manager.appendMessage({ role: "user", content: prompt, timestamp: Date.now() });
-		const result = await emit("before_agent_start", { prompt, systemPrompt: "BASE" }) as BeforeAgentStartEventResult | undefined;
+		const result = await emit("before_agent_start", { prompt, systemPrompt: "BASE", systemPromptOptions: promptOptions() }) as BeforeAgentStartEventResult | undefined;
 		if (result?.message) manager.appendCustomMessageEntry(result.message.customType, result.message.content, result.message.display, result.message.details);
 		return result;
 	};
+	/** One foreground agent run as Pi reports it: the request context, then the reply that ends the run. */
+	const foregroundRun = async (prompt: string, reply: Partial<AssistantMessage> = {}) => {
+		await turn(prompt);
+		const request: ContextWithSystemEvent["messages"] = [
+			{ role: "system", content: crypto.randomUUID(), timestamp: Date.now(), toolsAdded: [{ name: "read", description: crypto.randomUUID(), parameters: Type.Object({}) }] },
+			{ role: "user", content: prompt, timestamp: Date.now() },
+		];
+		await emit("context_with_system", { type: "context_with_system", messages: request });
+		const final: AssistantMessage = { ...assistantMessage(ctx.model as Model<Api>, crypto.randomUUID()), thinkingLevel: sessionThinking, ...reply };
+		manager.appendMessage(final);
+		await emit("message_end", { type: "message_end", message: final });
+		return { request, reply: final };
+	};
 	await emit("session_start");
 	return {
-		root, cwd, ctx, config, paths: resolvePaths(cwd, config), manager, notifications, emit, command, save, turn,
+		root, cwd, ctx, config, paths: resolvePaths(cwd, config), manager, notifications, emit, command, save, turn, foregroundRun,
 		globalConfigFile: memoryHome.globalConfigFile, modelRequests,
 		registerModel: (model: Model<Api>, authenticated = true) => registeredModels.push({ model, authenticated }),
 		sessionThinking: () => sessionThinking,
@@ -136,7 +163,10 @@ async function createSession() {
 		panel: () => panel,
 		complete: (prefix: string) => commands.get("memory")?.getArgumentCompletions?.(prefix),
 		modelCalls: () => modelCalls,
-		parentRule,
+		parentRule, foregroundOnly,
+		setAppendSystemPrompt: (text: string) => { appendSystemPrompt = text; },
+		setContextUsage: (usage: typeof contextUsage) => { contextUsage = usage; },
+		setSettings: (value: typeof settings) => { settings = value; },
 		activeTools: () => activeTools,
 		setIdleWaiter: (waiter: () => Promise<void>) => { waitForIdle = waiter; },
 		setModelReply: (reply: typeof modelReply) => { modelReply = reply; },
@@ -160,7 +190,7 @@ function memory(name: string, body: string, pinned = false) {
 function runMemoryJob(s: Awaited<ReturnType<typeof createSession>>, kind: MemoryJobRequest["kind"], model?: JobModelSelection) {
 	return new MemoryJobs().run(s.ctx, {
 		kind, model, paths: s.paths, sessionId: s.manager.getSessionId(), sessionThinkingLevel: s.sessionThinking(),
-		systemPrompt: s.parentRule, prompt: crypto.randomUUID(),
+		systemPrompt: s.parentRule, prompt: { instructions: crypto.randomUUID(), input: crypto.randomUUID() },
 	});
 }
 
@@ -606,6 +636,113 @@ test("project switches survive reload and preserve unrelated settings", async ()
 	assert.ok(s.activeTools().includes("memory_save"));
 	await s.save("enabled");
 	assert.ok(fs.existsSync(path.join(s.paths.personalDir, "enabled.md")));
+}));
+
+test("memory jobs send project instructions in a prefix that stays stable across runs", async () => withSession(async (s) => {
+	const appended = crypto.randomUUID();
+	s.setAppendSystemPrompt(appended);
+	const requests: Context[] = [];
+	s.setModelReply((request) => { requests.push(request); return JSON.stringify({ ops: [] }); });
+	const first = crypto.randomUUID(), second = crypto.randomUUID();
+	await s.turn(`Please remember ${first}`);
+	await s.emit("agent_settled");
+	await s.turn(`Please remember ${second}`);
+	await s.command("memory-extract");
+	await s.command("dream");
+	assert.equal(requests.length, 3);
+	for (const request of requests) {
+		assert.ok(request.systemPrompt?.includes(s.parentRule) && request.systemPrompt.includes(appended));
+		assert.ok(!request.systemPrompt?.includes(s.foregroundOnly));
+	}
+	const [automatic, manual] = requests;
+	assert.equal(manual?.systemPrompt, automatic?.systemPrompt);
+	for (const [request, text] of [[automatic, first], [manual, second]] as const) {
+		assert.ok(JSON.stringify(request?.messages).includes(text));
+		assert.ok(!request?.systemPrompt?.includes(text));
+	}
+}));
+
+test("extraction on the foreground model resends the foreground request and only appends to it", async () => withSession(async (s) => {
+	const thinkingBudgets = { low: Math.floor(Math.random() * 1000) + 1 };
+	s.setSettings({ thinkingBudgets, transport: "websocket-cached" });
+	fs.writeFileSync(path.join(s.paths.personalDir, "existing.md"), memory("existing", crypto.randomUUID()));
+	let calls = 0;
+	s.setModelReply(() => ++calls === 1 ? JSON.stringify({ read: ["existing.md"] }) : JSON.stringify({ ops: [] }));
+	const prompt = `Please remember ${crypto.randomUUID()}`;
+	const { request, reply } = await s.foregroundRun(prompt);
+	await s.emit("agent_settled");
+	assert.equal(s.modelRequests.length, 2);
+	const expected = [...convertToLlm(request), reply];
+	const [first, second] = s.modelRequests;
+	assert.ok(first && second);
+	for (const call of [first, second]) {
+		assert.equal(call.context.systemPrompt, undefined);
+		assert.deepEqual(call.context.messages.slice(0, expected.length), structuredClone(expected));
+		assert.equal(call.options?.sessionId, s.manager.getSessionId());
+		assert.deepEqual(call.options?.thinkingBudgets, thinkingBudgets);
+		assert.equal(call.options?.transport, "sse");
+	}
+	const appended = first.context.messages.slice(expected.length);
+	assert.equal(appended.length, 1);
+	assert.ok(JSON.stringify(appended).includes("existing.md") && !JSON.stringify(appended).includes(prompt));
+	// Later rounds extend the earlier request, so each one can read the previous one from cache.
+	assert.deepEqual(second.context.messages.slice(0, first.context.messages.length), first.context.messages);
+}));
+
+test("extraction uses the compact prefix when the foreground prefix cannot be reused", async () => {
+	const other = modelFixture();
+	const scenarios: [string, (s: Awaited<ReturnType<typeof createSession>>) => Promise<void>][] = [
+		["different job model", async (s) => {
+			s.registerModel(other);
+			await saveJobModel(s.cwd, "extractModel", { provider: other.provider, model: other.id });
+			await s.emit("session_start");
+			await s.foregroundRun(crypto.randomUUID());
+		}],
+		["different thinking level", async (s) => { await s.foregroundRun(crypto.randomUUID()); s.setSessionThinking("high"); }],
+		["run ended on a tool call", async (s) => {
+			await s.foregroundRun(crypto.randomUUID(), { stopReason: "toolUse", content: [{ type: "toolCall", id: crypto.randomUUID(), name: "read", arguments: {} }] });
+		}],
+		["message after the reply", async (s) => {
+			await s.foregroundRun(crypto.randomUUID());
+			await s.emit("message_end", { type: "message_end", message: { role: "user", content: crypto.randomUUID(), timestamp: Date.now() } });
+		}],
+		["nearly full context", async (s) => { s.setContextUsage({ tokens: 199_000, contextWindow: 200_000, percent: 99.5 }); await s.foregroundRun(crypto.randomUUID()); }],
+		["blocked images", async (s) => {
+			s.setSettings({ images: { blockImages: true } });
+			await s.turn(crypto.randomUUID());
+			const messages: ContextWithSystemEvent["messages"] = [{ role: "user", timestamp: Date.now(), content: [{ type: "image", data: "AA==", mimeType: "image/png" }] }];
+			await s.emit("context_with_system", { type: "context_with_system", messages });
+			const reply = { ...assistantMessage(s.ctx.model as Model<Api>, crypto.randomUUID()), thinkingLevel: s.sessionThinking() };
+			s.manager.appendMessage(reply);
+			await s.emit("message_end", { type: "message_end", message: reply });
+		}],
+		["new session", async (s) => { await s.foregroundRun(crypto.randomUUID()); await s.emit("session_start"); s.addUser(crypto.randomUUID()); }],
+	];
+	for (const [name, arrange] of scenarios) {
+		await withSession(async (s) => {
+			await arrange(s);
+			await s.command("memory-extract");
+			const call = s.modelRequests.at(-1);
+			assert.ok(call, name);
+			assert.ok(call.context.systemPrompt, name);
+			assert.equal(call.context.messages.length, 1, name);
+			assert.notEqual(call.options?.sessionId, s.manager.getSessionId(), name);
+		});
+	}
+});
+
+test("tool calls in a forked extraction are answered without running tools", async () => withSession(async (s) => {
+	const id = crypto.randomUUID();
+	let calls = 0;
+	s.setModelReply(() => ++calls === 1
+		? { stopReason: "toolUse", content: [{ type: "toolCall", id, name: "read", arguments: { path: crypto.randomUUID() } }] }
+		: JSON.stringify({ ops: [{ op: "upsert", file: "kept.md", type: "project", description: "Kept", body: crypto.randomUUID() }] }));
+	await s.foregroundRun(`Please remember ${crypto.randomUUID()}`);
+	await s.emit("agent_settled");
+	assert.equal(s.modelRequests.length, 2);
+	const result = s.modelRequests[1]?.context.messages.at(-1);
+	assert.ok(result?.role === "toolResult" && result.toolCallId === id && result.isError);
+	assert.ok(fs.existsSync(path.join(s.paths.personalDir, "kept.md")));
 }));
 
 test("invalid settings remain intact and failed saves do not change running switches", async () => withSession(async (s) => {

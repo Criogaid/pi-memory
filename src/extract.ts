@@ -270,27 +270,71 @@ const OPERATION_INSTRUCTIONS = [
 	`Return at most ${LIMITS.extractMaxOps} operations. Keep each body under ${LIMITS.fileMaxBytes} bytes. If nothing is worth saving, output {"ops": []}.`,
 ].join("\n");
 
-export function buildExtractionPrompt(paths: MemoryPaths, transcript: string, newMessageCount: number): string {
-	const memories = listMemories(paths);
-	const existing =
-		memories.length > 0
-			? `\n## Existing memory files\n\n${memories.map((m) => `- ${m.ref} (${m.type ?? "untyped"}) — ${m.description}`).join("\n")}\n\nCheck this list before writing — update an existing file rather than creating a duplicate.`
-			: "";
-	return [
-		"You are now acting as the memory extraction subagent. Analyze the most recent messages below and use them to update your persistent memory systems.",
-		"",
-		`You MUST only use content from the last ~${newMessageCount} messages. Do not waste any turns attempting to investigate or verify that content further — no grepping source files, no reading code to confirm a pattern exists, no git commands.`,
-		existing,
-		"",
-		"Apply the full memory rules from the system prompt. Read an existing memory before updating or deleting it.",
-		"",
-		OPERATION_INSTRUCTIONS,
-		"If the user explicitly asks you to remember something, save it immediately as whichever type fits best. If they ask you to forget something, find and remove the relevant entry.",
-		"",
-		"## Recent messages",
-		"",
-		transcript,
-	].join("\n");
+/**
+ * A memory job prompt split by stability. `instructions` is fixed per job kind and memory
+ * scope, so it can sit in a cached prefix; `input` carries everything that changes per run.
+ */
+export interface JobPrompt {
+	readonly instructions: string;
+	readonly input: string;
+}
+
+/** Instructions and context files that Pi loaded for the current project. */
+export interface ProjectInstructions {
+	readonly contextFiles: readonly { readonly path: string; readonly content: string }[];
+	readonly appendSystemPrompt?: string;
+}
+
+/**
+ * System prompt for jobs that cannot share the foreground prompt cache. Only the memory rules
+ * and the project's instructions carry over; foreground tool, skill, and harness sections are
+ * irrelevant to a tool-less JSON job and would be paid for on every run.
+ */
+export function buildJobSystemPrompt(cwd: string, memoryRules: string, project: ProjectInstructions): string {
+	const sections = [
+		`You maintain the persistent file-based memory of a pi coding-agent session for the project at ${cwd.replace(/\\/g, "/")}.`,
+		memoryRules,
+	];
+	if (project.appendSystemPrompt) sections.push(`<addendum>\n${project.appendSystemPrompt}\n</addendum>`);
+	if (project.contextFiles.length > 0) {
+		sections.push([
+			"Project-specific instructions and guidelines:",
+			...project.contextFiles.map(({ path, content }) => `<project_instructions path="${path}">\n${content}\n</project_instructions>`),
+		].join("\n\n"));
+	}
+	return sections.join("\n\n");
+}
+
+function existingMemoryList(paths: MemoryPaths): string {
+	return listMemories(paths).map((m) => `- ${m.ref} (${m.type ?? "untyped"}) — ${m.description}`).join("\n");
+}
+
+const EXTRACTION_INSTRUCTIONS = [
+	"You are now acting as the memory extraction subagent. Analyze the most recent messages supplied with this request and use them to update your persistent memory systems.",
+	"",
+	"You MUST only use content from those recent messages. Do not waste any turns attempting to investigate or verify that content further — no grepping source files, no reading code to confirm a pattern exists, no git commands.",
+	"",
+	"Check the supplied existing memory files before writing — update an existing file rather than creating a duplicate.",
+	"",
+	"Apply the full memory rules from the system prompt. Read an existing memory before updating or deleting it.",
+	"",
+	OPERATION_INSTRUCTIONS,
+	"If the user explicitly asks you to remember something, save it immediately as whichever type fits best. If they ask you to forget something, find and remove the relevant entry.",
+].join("\n");
+
+/** A null transcript means the messages precede this request, as when it extends the foreground context. */
+export function buildExtractionPrompt(paths: MemoryPaths, transcript: string | null, newMessageCount: number): JobPrompt {
+	const existing = existingMemoryList(paths);
+	return {
+		instructions: EXTRACTION_INSTRUCTIONS,
+		input: [
+			transcript === null
+				? `Use only the last ~${newMessageCount} messages of the conversation before this request.`
+				: `Use only the last ~${newMessageCount} messages.`,
+			`## Existing memory files\n\n${existing || "(none)"}`,
+			...(transcript === null ? [] : [`## Recent messages\n\n${transcript}`]),
+		].join("\n\n"),
+	};
 }
 
 export type MemoryReply = { readonly kind: "read"; readonly files: readonly string[] } | { readonly kind: "readProject"; readonly files: readonly string[] } | { readonly kind: "apply"; readonly ops: readonly unknown[] };
@@ -315,9 +359,8 @@ export function parseExtractResponse(text: string): MemoryReply | null {
 }
 
 /** Dream uses the same operation protocol as extraction; Pi owns project reads. */
-export function buildDreamPrompt(paths: MemoryPaths, transcripts: string): string {
-	const existing = listMemories(paths).map((m) => `- ${m.ref} (${m.type ?? "untyped"}) — ${m.description}`).join("\n");
-	return [
+export function buildDreamPrompt(paths: MemoryPaths, transcripts: string): JobPrompt {
+	const instructions = [
 		DREAM_HEADER,
 		"Consolidate durable knowledge using the inherited memory rules and project instructions.",
 		"Phase 1 — Orient: inspect the existing-file list and read the memories relevant to recent work before editing them.",
@@ -327,11 +370,11 @@ export function buildDreamPrompt(paths: MemoryPaths, transcripts: string): strin
 		"Reconcile feedback and project memories with AGENTS.md in the inherited instructions. Preserve extra context that does not conflict. If dated evidence suggests AGENTS.md is stale, annotate the memory for verification; do not edit AGENTS.md. A correction alone does not establish which source is newer.",
 		paths.teamDir ? "Team memories: consolidate within team/ conservatively. Delete a team memory only with evidence it is wrong or superseded, never because it is unfamiliar. Do not create team memories or promote personal memories during Dream; promotion requires /remember." : "",
 		OPERATION_INSTRUCTIONS,
-		"## Existing memory files",
-		existing,
-		"## Recent session excerpts",
-		transcripts,
-	].join("\n\n");
+	].filter(Boolean).join("\n\n");
+	return {
+		instructions,
+		input: ["## Existing memory files", existingMemoryList(paths) || "(none)", "## Recent session excerpts", transcripts].join("\n\n"),
+	};
 }
 
 /** Exclude legacy Dream turns injected by older plugin versions from recall. */

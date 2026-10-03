@@ -51,6 +51,7 @@ const pi: any = {
 		pi._activeTools = names;
 	},
 	getThinkingLevel: () => "off",
+	getSettings: () => ({}),
 	_activeTools: null as string[] | null,
 	_sent: null as string | null,
 };
@@ -86,6 +87,7 @@ function mkCtx(opts: { reply?: () => Promise<Partial<AssistantMessage>> } = {}) 
 		},
 		model: sessionModel,
 		getSystemPrompt: () => "",
+		getContextUsage: () => undefined,
 		modelRegistry: { streamSimple: () => ({ result: async (): Promise<AssistantMessage> => {
 			if (!opts.reply) throw new Error("No model call expected");
 			return { ...assistantMessage(sessionModel, ""), ...await opts.reply() };
@@ -101,7 +103,7 @@ const slugDir = fs.readdirSync(memRoot)[0];
 check("[1] memory dirs created", Boolean(slugDir), path.join(memRoot, slugDir ?? "?"));
 
 // 2) system prompt carries the real path + Memory section + empty index state
-const r2: any = await handlers.get("before_agent_start")!({ systemPrompt: "BASE", prompt: "hello there friend" }, mkCtx());
+const r2: any = await handlers.get("before_agent_start")!({ systemPrompt: "BASE", systemPromptOptions: { cwd: process.cwd() }, prompt: "hello there friend" }, mkCtx());
 const sp = r2.systemPrompt as string;
 check("[2] real personal path in prompt", sp.includes(path.join(memRoot, slugDir).replace(/\\/g, "/")) || sp.includes(memRoot));
 check("[2] no recall before any memory exists", r2.message === undefined);
@@ -119,7 +121,7 @@ check("[3] index updated", fs.readFileSync(path.join(memRoot, slugDir, "MEMORY.m
 // 3b) prompt snapshot stays STABLE after a mid-session save (cache fidelity:
 //     Claude Code builds the memory prompt once per session; index edits
 //     reach the model via recall messages, not prompt rebuilds)
-const r3b: any = await handlers.get("before_agent_start")!({ systemPrompt: "BASE", prompt: "unrelated quantum banana" }, mkCtx());
+const r3b: any = await handlers.get("before_agent_start")!({ systemPrompt: "BASE", systemPromptOptions: { cwd: process.cwd() }, prompt: "unrelated quantum banana" }, mkCtx());
 check("[3b] snapshot unchanged after mid-session save", r3b.systemPrompt === sp, "prefix identical byte-for-byte");
 
 // 4) rejections: secrets + traversal + oversize
@@ -131,9 +133,9 @@ const r4c = await save.execute("t4", { name: "big", type: "user", description: "
 check("[4] oversize body blocked", r4c.isError === true);
 
 // 5) recall on a matching second prompt, cc-memory gated off
-const r5: any = await handlers.get("before_agent_start")!({ systemPrompt: "BASE", prompt: "how do I run the tests here" }, mkCtx());
+const r5: any = await handlers.get("before_agent_start")!({ systemPrompt: "BASE", systemPromptOptions: { cwd: process.cwd() }, prompt: "how do I run the tests here" }, mkCtx());
 check("[5] recall message injected", r5?.message?.customType === "pi-memory:recall");
-const r5b: any = await handlers.get("before_agent_start")!({ systemPrompt: "BASE", prompt: "how do I run the tests here" }, mkCtx());
+const r5b: any = await handlers.get("before_agent_start")!({ systemPrompt: "BASE", systemPromptOptions: { cwd: process.cwd() }, prompt: "how do I run the tests here" }, mkCtx());
 check("[5] recall deduped on repeat", r5b?.message === undefined);
 
 // 6) pause blocks writes into memory dirs only
@@ -223,7 +225,7 @@ fs.writeFileSync(
 	path.join(memRoot, slugDir, "deploy-policy.md"),
 	"---\nname: deploy-policy\ndescription: 部署必须走运维面板\nmetadata:\n  type: reference\n---\n\n部署经由 ops dashboard。",
 );
-const r10: any = await handlers.get("before_agent_start")!({ systemPrompt: "BASE", prompt: "部署流程是什么样的" }, mkCtx());
+const r10: any = await handlers.get("before_agent_start")!({ systemPrompt: "BASE", systemPromptOptions: { cwd: process.cwd() }, prompt: "部署流程是什么样的" }, mkCtx());
 check("[10] CJK query recall", String(r10?.message?.content ?? "").includes("deploy-policy.md"));
 
 // 11) paused `#` shortcut is handled (not passed through to the model)
@@ -255,7 +257,7 @@ check(
 // 15) enabled toggle makes the extension fully inert
 {
 	await commands.get("memory")!.handler("off", mkCtx());
-	const inert: any = await handlers.get("before_agent_start")!({ systemPrompt: "BASE", prompt: "how do I run the tests here" }, mkCtx());
+	const inert: any = await handlers.get("before_agent_start")!({ systemPrompt: "BASE", systemPromptOptions: { cwd: process.cwd() }, prompt: "how do I run the tests here" }, mkCtx());
 	check("[15] disabled: no prompt injection", inert?.systemPrompt === "BASE" || inert === undefined);
 	check("[15] disabled: no recall", inert?.message === undefined);
 	const r15 = await handlers.get("tool_call")!({ toolName: "write", input: { path: memFileAbs, content: "x" } }, mkCtx());
@@ -288,7 +290,7 @@ check(
 		"---\nname: long-memory\ndescription: very long memory\nmetadata:\n  type: reference\n---\n\n" +
 			longLines.join("\n"),
 	);
-	const r17: any = await handlers.get("before_agent_start")!({ systemPrompt: "BASE", prompt: "tell me about the very long memory" }, mkCtx());
+	const r17: any = await handlers.get("before_agent_start")!({ systemPrompt: "BASE", systemPromptOptions: { cwd: process.cwd() }, prompt: "tell me about the very long memory" }, mkCtx());
 	const content = String(r17?.message?.content ?? "");
 	check("[17] long memory recall is truncated", content.includes(longLines[0]) && !content.includes(longLines.at(-1)!));
 }
@@ -342,9 +344,9 @@ check(
 
 	// z4n single-token skip: a lone word skips recall even when it matches
 	fs.writeFileSync(path.join(paths20.personalDir, "single-probe.md"), "---\nname: single-probe\ndescription: zzzprobe uniquewordalpha\nmetadata:\n  type: user\n---\n\nbody\n");
-	const r20s: any = await handlers.get("before_agent_start")!({ systemPrompt: "BASE", prompt: "uniquewordalpha" }, mkCtx());
+	const r20s: any = await handlers.get("before_agent_start")!({ systemPrompt: "BASE", systemPromptOptions: { cwd: process.cwd() }, prompt: "uniquewordalpha" }, mkCtx());
 	check("[20] single-token non-CJK does not select the candidate", !String(r20s.message?.content ?? "").includes("zzzprobe.md"));
-	const r20m: any = await handlers.get("before_agent_start")!({ systemPrompt: "BASE", prompt: "uniquewordalpha zzzprobe" }, mkCtx());
+	const r20m: any = await handlers.get("before_agent_start")!({ systemPrompt: "BASE", systemPromptOptions: { cwd: process.cwd() }, prompt: "uniquewordalpha zzzprobe" }, mkCtx());
 	check("[20] multi-word recall still fires", r20m.message !== undefined);
 
 	// u$t edge cases: control chars rejected, leading-whitespace heading accepted
@@ -402,8 +404,10 @@ check(
 // Internal Dream turns must not recall otherwise-relevant stored memories.
 {
 	const { buildDreamPrompt } = await import("../src/extract.ts");
-	const dream = buildDreamPrompt({ personalDir: memRoot, teamDir: null }, "sessions");
-	const result = await handlers.get("before_agent_start")!({ systemPrompt: "BASE", prompt: dream }, mkCtx());
+	const prompt = buildDreamPrompt({ personalDir: memRoot, teamDir: null }, "sessions");
+	// Older plugin versions injected the whole Dream prompt as a foreground turn.
+	const dream = `${prompt.instructions}\n\n${prompt.input}`;
+	const result = await handlers.get("before_agent_start")!({ systemPrompt: "BASE", systemPromptOptions: { cwd: process.cwd() }, prompt: dream }, mkCtx());
 	check("internal Dream turn skips recall", result?.message === undefined);
 }
 
